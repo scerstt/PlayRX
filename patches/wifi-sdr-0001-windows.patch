@@ -1,5 +1,5 @@
 diff --git a/src/receiver.cpp b/src/receiver.cpp
-index af47d55..5c0c686 100644
+index af47d55..3cc7a17 100644
 --- a/src/receiver.cpp
 +++ b/src/receiver.cpp
 @@ -3,6 +3,7 @@
@@ -47,8 +47,32 @@ index af47d55..5c0c686 100644
      c.la.igi = cur.agc ? -1 : igi_for(cur.gain_db, _caps.cu);
      c.la.no_cca = !cur.agc;
      c.la.dfir = !_caps.cu && width >= 40 ? width : 0; // 0 leaves devourer's DFIR (8822B: BW20 set; 8822C: per width)
+@@ -283,14 +287,22 @@ void Receiver::worker() {
+       _st.gapped = c.gapped;
+       _st.state = RxState::Streaming;
+     }
++    // banks the run drops are counted in the status at once, and leave a hole in BankMeta::seq
++    c.on_drop = [&](bool at_start) {
++      std::lock_guard<std::mutex> l(_m);
++      (at_start ? _st.start_late_skips : _st.mid_drops)++;
++    };
++    uint32_t run_next = 0; // the run's own number (BankInfo::seq) of the bank after the last one delivered
+     bool clean_start = false;
+-    const auto on_bank = [&](const uint8_t *bank, const BankInfo &) {
++    const auto on_bank = [&](const uint8_t *bank, const BankInfo &bi) {
+       if (!clean_start) {
+         clean_start = true;
+         consecutive_faults = 0;
+         std::lock_guard<std::mutex> l(_m);
+         _st.error.clear();
+       }
++      seq += bi.seq - run_next; // the run's count includes the banks it dropped before this one
++      run_next = bi.seq + 1;
+       meta.seq = seq++;
+       {
+         std::lock_guard<std::mutex> l(_m);
 diff --git a/src/receiver.h b/src/receiver.h
-index 740bd8f..79a8132 100644
+index 740bd8f..4e18d9a 100644
 --- a/src/receiver.h
 +++ b/src/receiver.h
 @@ -46,6 +46,9 @@ inline uint16_t model_pid(uint16_t vid, uint16_t pid) {
@@ -61,6 +85,27 @@ index 740bd8f..79a8132 100644
    int rate_sel = 5;     // fs = 80 MHz >> rate_sel: 5 = 2.5, 4 = 5, 3 = 10, 2 = 20, 1 = 40 MS/s; 0 = 80 MS/s
                          // (8812BU, gapped only: 80 MHz width + vendor BW80 RX DFIR, ~77 MHz at -6 dB)
    bool wide = true;     // at 40 MS/s: 40 MHz channel width (8812BU: + vendor BW40 RX DFIR; 8822C: devourer's
+@@ -70,7 +73,8 @@ enum class RxState { Closed, Opening, Starting, Streaming, Lost, Error };
+ const char *rx_state_name(RxState s);
+ 
+ struct BankMeta {
+-  uint64_t seq = 0;      // banks delivered since start()
++  uint64_t seq = 0;      // banks since start(), counting those a run dropped (late or overrun, see RxStatus), so
++                         // a step of more than 1 within one gen means samples are missing there
+   uint32_t gen = 0;      // stream run (changes on every restart: reset DSP state when it does)
+   uint32_t cfg = 0;      // settings generation (changes only when the caller changed settings)
+   double fs = 0;         // sample rate
+@@ -98,6 +102,10 @@ struct RxStatus {
+   bool settling = false; // a settings change is waiting to be applied (the run above is about to end)
+   bool gapped = false;   // the current run is gapped (BankMeta::gapped)
+   unsigned start_retries = 0; // stream starts repeated because the first packet never came (issue #2)
++  // Banks the 8822B stream dropped instead of delivering them, counted as it drops them: late among the first
++  // few of a run / late or overrun mid-run (the run goes on; StreamStats has them only once the run ends).
++  // Since open().
++  uint64_t start_late_skips = 0, mid_drops = 0;
+ };
+ 
+ class Receiver {
 diff --git a/src/session.cpp b/src/session.cpp
 index d66ab4e..11c4b0e 100644
 --- a/src/session.cpp
@@ -92,7 +137,7 @@ index d66ab4e..11c4b0e 100644
    auto dev = driver.CreateRadio(h, ctx, lock, cfg);
    if (!dev)
 diff --git a/src/stream88xx.cpp b/src/stream88xx.cpp
-index a663615..df77beb 100644
+index a663615..16f5409 100644
 --- a/src/stream88xx.cpp
 +++ b/src/stream88xx.cpp
 @@ -27,6 +27,7 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
@@ -169,7 +214,7 @@ index a663615..df77beb 100644
          if (!trailer) {
            std::memcpy(bank.data() + chunk_off(part), d.data + 24, kChunk);
          } else {
-@@ -217,15 +256,33 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+@@ -217,15 +256,35 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
            bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
            bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
            bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
@@ -201,16 +246,29 @@ index a663615..df77beb 100644
          break;
 +      if (late_skip) {  // AnalogRX: a late bank at the start of the run is not handed on (see above)
 +        seen[b] = true;
++        if (_c.on_drop)  // nor is one dropped mid-run; either way the caller hears of it now
++          _c.on_drop(seq < kStartGraceBanks);
 +        continue;
 +      }
        // CPU-written windows: descriptors ([104,128) and the 24 bytes before chunks 1..3) and the
        // sentinel in the last sample. In live data the ADC must have overwritten all of them.
        uint8_t *tail = bank.data() + kBankBytes - 8;
 diff --git a/src/stream88xx.h b/src/stream88xx.h
-index 69c6cb3..0b04054 100644
+index 69c6cb3..51ddcb6 100644
 --- a/src/stream88xx.h
 +++ b/src/stream88xx.h
-@@ -51,6 +51,8 @@ struct StreamStats {
+@@ -33,6 +33,10 @@ struct StreamCfg {
+   int guard_us = 20;       // ship a bank this long after the ADC is due to finish it (< 0: test only)
+   bool gapped = false;     // capture one bank, stop, ship, re-arm (banks not contiguous)
+   unsigned pkt_timeout_ms = 200;
++  // Called on the stream thread each time run() drops a bank instead of handing it to on_bank (late or overrun),
++  // as it happens: StreamStats only comes back when the run ends, and a run that keeps dropping an occasional
++  // bank never does. at_start: one of the first banks of the run (start_late_skips), else mid_drops.
++  std::function<void(bool at_start)> on_drop;
+ };
+ 
+ struct BankInfo {
+@@ -51,6 +55,8 @@ struct StreamStats {
    unsigned stale = 0;
    unsigned pattern_bad = 0;
    unsigned start_retries = 0; // starts repeated because the first packet never came (issue #2)

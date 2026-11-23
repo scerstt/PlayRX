@@ -1993,7 +1993,7 @@ std::string state_json() {
         << ",\"b_share\":" << num(jnum(j, "b_share"), 2) << ",\"a_fade\":" << num(jnum(j, "a_fade"), 3)
         << ",\"rescued\":" << num(jnum(j, "rescued"), 2) << ",\"coherence\":" << num(jnum(j, "coherence"), 2) << "}";
         o << ",\"glitches\":{\"restarts\":" << num(jnum(j, "restarts"), 0) << ",\"rephases\":" << num(jnum(j, "rephases"), 0)
-          << ",\"lost\":" << num(jnum(j, "losses"), 0) << ",\"clicks\":" << num(jnum(j, "clicks_repaired"), 0) << ",\"mended\":" << num(jnum(j, "lines_kept"), 0) << "}";
+          << ",\"dropped\":" << num(jnum(j, "stream_dropped"), 0) << ",\"lost\":" << num(jnum(j, "losses"), 0) << ",\"clicks\":" << num(jnum(j, "clicks_repaired"), 0) << ",\"mended\":" << num(jnum(j, "lines_kept"), 0) << "}";
     }
     o << "}";
   }

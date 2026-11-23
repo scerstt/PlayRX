@@ -34,6 +34,7 @@ constexpr double kStep = 20e6;       // a hump up to ~13 MHz wide is fully insid
 constexpr double kCapture = 0.09;    // s of IQ per scan step (60 ms acquisition + ~300 lines)
 constexpr double kPsdSpan = 0.012;   // s of it for the spectrum
 constexpr int kSettleBanks = 40;     // ~8 ms after a retune (chip AGC)
+constexpr int kCapRestarts = 8;      // times a scan step's capture starts over after a gap; then gaps stay in
 
 // Raise this thread's priority (the USB stream thread must never miss a chip deadline; the DSP thread
 // must keep up). Best effort: logs what the OS allowed.
@@ -118,13 +119,18 @@ void Radio::open(int bus, const std::string &port) {
   _banks = 0;
   _dropped = 0;
   _stop = false;
-  _rx = std::move(rx);
+  {
+    std::lock_guard<std::mutex> l(_rxm);
+    _rx = std::move(rx);
+  }
   _ddropped = 0;
+  _started = false;
   _dsp = std::thread([this] { dsp_loop(); });
   _decoder = std::thread([this] { decode_loop(); });
   _rx->start([this](const uint8_t *b, size_t n, const wsdr::BankMeta &m) {
     on_bank(b, n, m.seq, m.gen, m.fs, m.centre_hz, m.shift_hz);
   });
+  _started = true;
 }
 
 void Radio::close() {
@@ -139,14 +145,23 @@ void Radio::close() {
     _dq.clear();
   }
   _fe.reset();
-  if (_rx) {
-    _rx->close();
-    _rx.reset();
+  // out of status_json()'s sight first, then closed: closing can take a while, and a status poll (the UI's
+  // thread) must not wait for it
+  std::unique_ptr<wsdr::Receiver> rx;
+  {
+    std::lock_guard<std::mutex> l(_rxm);
+    rx = std::move(_rx);
+  }
+  if (rx) {
+    rx->close();
+    rx.reset();
     KP_LOGI("radio: closed");
   }
-  std::lock_guard<std::mutex> l(_m);
-  _open = false;
-  _mode = Mode::Idle;
+  {
+    std::lock_guard<std::mutex> l(_m);
+    _open = false;
+    _mode = Mode::Idle;
+  }
   std::lock_guard<std::mutex> q(_qm);
   _q.clear();
 }
@@ -225,15 +240,23 @@ void Radio::tune(double hz, int rate_sel, bool watching) {
   _req_rate = rate_sel;
 }
 
+// The mode calls do nothing on a radio that is not open, and that is decided under the lock open() and close()
+// set _open under: a call that races a close can no longer leave the closed radio in its mode.
 void Radio::scan() {
   std::lock_guard<std::mutex> l(_m);
+  if (!_open) return;
   _resume_hz = _mode == Mode::Watch ? _watch_hz : 0;
   _mode = Mode::Scan;
   _mode_epoch++;
+  // the status says "scan" from here on: its progress with it, not what the scan before left (the DSP thread
+  // sets both again when it takes the scan up, and moves the step on only for the scan it is working on)
+  _step = 0;
+  _plan_n = scan_plan().size();
 }
 
 void Radio::time_channels(const std::vector<double> &hz) {
   std::lock_guard<std::mutex> l(_m);
+  if (!_open) return;
   _time_req_hz.assign(hz.begin(), hz.begin() + std::min<size_t>(hz.size(), kMaxTimed));
   _mode = Mode::Timing;
   _mode_epoch++;
@@ -241,6 +264,7 @@ void Radio::time_channels(const std::vector<double> &hz) {
 
 void Radio::watch(double hz) {
   std::lock_guard<std::mutex> l(_m);
+  if (!_open) return;
   _watch_hz = hz;
   _mode = Mode::Watch;
   _mode_epoch++;
@@ -248,6 +272,7 @@ void Radio::watch(double hz) {
 
 void Radio::idle() {
   std::lock_guard<std::mutex> l(_m);
+  if (!_open) return;
   _mode = Mode::Idle;
   _mode_epoch++;
 }
@@ -298,18 +323,30 @@ void Radio::dsp_loop() {
   Bank b;
   _load_t0_ms = now_ms();
   while (!_stop) {
+    bool none;
     {
       std::unique_lock<std::mutex> l(_qm);
       _qcv.wait_for(l, std::chrono::milliseconds(200), [&] { return !_q.empty() || _stop; });
-      if (_q.empty()) {
-        if (_rx && !_rx->status().running) {
-          KP_LOGE("radio: receiver stopped: %s", _rx->status().error.c_str());
+      if (_stop) break;  // close(): stops the receiver too, which is not a death
+      none = _q.empty();
+      if (!none) {
+        b = std::move(_q.front());
+        _q.pop_front();
+      }
+    }
+    if (none) {
+      // Outside the queue's lock (the receiver's own lock is never taken while holding it). And only once open()
+      // has the receiver started: this thread runs before that call, and a receiver not yet running is not one
+      // that stopped.
+      if (_started && _rx) {
+        const wsdr::RxStatus st = _rx->status();
+        if (_stop) break;  // close() got in between: it stopped the receiver itself
+        if (!st.running) {
+          KP_LOGE("radio: receiver stopped: %s", st.error.c_str());
           break;
         }
-        continue;
       }
-      b = std::move(_q.front());
-      _q.pop_front();
+      continue;
     }
     const auto t0 = std::chrono::steady_clock::now();
     Mode mode;
@@ -343,6 +380,8 @@ void Radio::dsp_loop() {
         tune(hz, rate, true);
       } else if (mode == Mode::Scan) {
         _plan = scan_plan();
+        _plan_n = _plan.size();
+        _at = 0;
         _step = 0;
         _cap.clear();
         _settle = -1;
@@ -390,8 +429,9 @@ void Radio::dsp_loop() {
       _busy_s = 0;
       _load_t0_ms = t;
       if (++_status_ticks % 5 == 0 && _mode == Mode::Watch)
-        KP_LOGI("status: watch %.1f MHz, cpu demod %.0f%% decode %.0f%%, dropped usb %llu decode %llu, restarts %llu, "
-                "%s %s lock %.2f fps %.0f, acq %llu lost %llu rephase %llu", _watch_hz / 1e6, _load * 100, _dload * 100,
+        KP_LOGI("status: watch %.1f MHz, cpu demod %.0f%% decode %.0f%%, dropped stream %llu usb %llu decode %llu, "
+                "restarts %llu, %s %s lock %.2f fps %.0f, acq %llu lost %llu rephase %llu", _watch_hz / 1e6,
+                _load * 100, _dload * 100, (unsigned long long)(_rx ? _rx->status().mid_drops : 0),
                 (unsigned long long)_dropped.load(), (unsigned long long)_ddropped.load(),
                 (unsigned long long)(_rx ? _rx->status().restarts : 0), _vstats.std_name,
                 _vstats.colour ? "colour" : "grey", _vstats.lock_recent, _fps,
@@ -420,22 +460,30 @@ void Radio::handle_watch(Bank &b) {
     _fe = std::make_shared<FrontEnd>(b.fs, b.shift_hz, _frames, o);
     _fe_fs = b.fs;
     _fe_shift = b.shift_hz;
+    // a new carrier or rate: no weights or noise estimates from the last one, and the paths' time offset is
+    // measured again (it is a number of samples, so it depends on the rate)
+    _comb.reset(b.fs);
   } else if (b.gen != _fe_gen) {
     // same settings: keep the decoder; it re-phases onto the restarted stream within a few lines
     std::string why;
     if (_rx) why = _rx->status().last_fault;
     KP_LOGW("radio: stream restarted (gen %u, %s), decoder keeps going", b.gen, why.c_str());
   }
+  // After a restart, or banks lost on the way here (dropped by the stream: a step in seq), this bank does not
+  // follow on from the last one: the combiner must not delay path B with samples from before the hole.
+  if (b.gen != _fe_gen || b.seq != _watch_seq + 1) _comb.cut();
   _fe_gen = b.gen;
+  _watch_seq = b.seq;
   unpack(b, _iq);
   const bool comb = _combine.load();
   unpack_b(b, _iqb);  // always: cheap
   measure(b);
   if (comb != _combine_was) {
-    _comb.reset();
+    _comb.reset(b.fs);
     _combine_was = comb;
     KP_LOGI("radio: video antennas %s", comb ? "A + B combined" : "A only");
   }
+  // two-antenna video: B lined up and turned into step with A and both weighted by their SNR, in place of A
   if (comb) _comb.process(_iq.data(), _iqb.data(), std::min(_iq.size(), _iqb.size()));
   const int64_t tnow = now_ms();
   if (tnow - _comb_t0_ms >= 1000) {
@@ -443,8 +491,16 @@ void Radio::handle_watch(Bank &b) {
     ComboStatus cs;
     cs.on = comb;
     if (comb) cs.s = _comb.take_stats();
-    std::lock_guard<std::mutex> l(_m);
-    _comb_status = cs;
+    bool news;
+    {
+      std::lock_guard<std::mutex> l(_m);
+      news = comb && (!_comb_status.on || cs.s.lag != _comb_status.s.lag ||
+                      cs.s.lag_measured != _comb_status.s.lag_measured);
+      _comb_status = cs;
+    }
+    if (news)
+      KP_LOGI("radio: antenna B taken as %d samples (%.0f ns) ahead of A, %s", cs.s.lag, cs.s.lag / b.fs * 1e9,
+              cs.s.lag_measured ? "measured" : "none until measured");
   }
   std::vector<float> d;
   {
@@ -710,11 +766,12 @@ void Radio::decode_loop() {
 }
 
 void Radio::handle_scan(Bank &b) {
-  if (_step >= _plan.size()) return;
-  const double req = _plan[_step];
+  if (_at >= _plan.size()) return;
+  const double req = _plan[_at];
   if (std::fabs(b.centre_hz + b.shift_hz - req) > 1e3 || b.fs != kFs) return;
   if (_settle < 0) {
     _settle = kSettleBanks;
+    _cap_restarts = 0;
     _cap.clear();
     _cap_need = static_cast<size_t>(kPsdSpan * kFs);  // first just enough for the spectrum
     _humps.clear();
@@ -722,10 +779,16 @@ void Radio::handle_scan(Bank &b) {
   if (_settle > 0) {
     _settle--;
     _cap_last_seq = b.seq;
+    _cap_gen = b.gen;
     return;
   }
-  if (!_cap.empty() && b.seq != _cap_last_seq + 1) _cap.clear();  // a gap: start the capture over
+  // A gap (banks dropped on the way, or the stream restarted): start the capture over. Not for ever: on a link
+  // that loses a bank every few ms no capture would ever be whole and the scan would stay on this step, so after
+  // kCapRestarts tries it is taken with its gaps (the sync check loses a few lines at each).
+  const bool gap = b.seq != _cap_last_seq + 1 || b.gen != _cap_gen;
+  if (!_cap.empty() && gap && _cap_restarts++ < kCapRestarts) _cap.clear();
   _cap_last_seq = b.seq;
+  _cap_gen = b.gen;
   _cap_centre = b.centre_hz;
   const size_t ns = b.data.size() / 8;
   const uint8_t *p = b.data.data();
@@ -753,9 +816,9 @@ void Radio::handle_scan(Bank &b) {
 void Radio::scan_step_done() {
   const double centre = _cap_centre;  // the samples are centred on the hardware centre, not the request
   // start the next retune now; the chip settles while this step is analysed
-  _step++;
-  if (_step < _plan.size()) {
-    tune(_plan[_step], 1);
+  _at++;
+  if (_at < _plan.size()) {
+    tune(_plan[_at], 1);
     _settle = -1;
   }
   std::vector<cf> x(_humps.empty() ? 0 : _cap.size());
@@ -778,10 +841,15 @@ void Radio::scan_step_done() {
     pl.seen_ms = now_ms();
     found.push_back(pl);
   }
-  bool done = _step >= _plan.size();
+  const bool done = _at >= _plan.size();
   double next_watch = 0;
   {
     std::lock_guard<std::mutex> l(_m);
+    // A mode call made since this bank's mode was read (from another thread, while this step was analysed)
+    // has the last word: the status shows its progress (a scan called again starts at 0), and the end of
+    // this scan does not put a watch of its own choosing over it. The next bank takes that call up.
+    const bool current = _mode_epoch == _epoch_seen;
+    if (current) _step = _at;
     for (const auto &f : found) {
       auto it = std::find_if(_pilots.begin(), _pilots.end(), [&](const Pilot &p) { return std::fabs(p.mhz - f.mhz) < 4; });
       if (it == _pilots.end()) _pilots.push_back(f);
@@ -789,7 +857,7 @@ void Radio::scan_step_done() {
       else it->seen_ms = f.seen_ms;
     }
     std::sort(_pilots.begin(), _pilots.end(), [](const Pilot &a, const Pilot &b) { return a.snr_db > b.snr_db; });
-    if (done) {
+    if (done && current) {
       // after a scan: the pilot watched before, if still there, else the strongest seen in this scan
       const int64_t scan_start = now_ms() - 60000;
       for (const auto &p : _pilots)
@@ -827,34 +895,42 @@ static std::string jstr(const std::string &s) {
 std::string Radio::status_json() {
   std::ostringstream o;
   wsdr::RxStatus rs;
-  if (_rx) rs = _rx->status();
+  {
+    std::lock_guard<std::mutex> l(_rxm);
+    if (_rx) rs = _rx->status();
+  }
   std::lock_guard<std::mutex> l(_m);
+  // A JSON number or nothing: a nan or inf printed as it comes is not JSON, and a reader may choke on it or,
+  // worse, take it for a string.
+  const auto num = [](double v) { return std::isfinite(v) ? v : 0.0; };
   static const char *modes[] = {"idle", "scan", "watch", "test", "timing"};
   o << "{\"open\":" << (_open ? "true" : "false") << ",\"usb3\":" << (_superspeed ? "true" : "false")
     << ",\"chip\":" << jstr(_chip) << ",\"rx_state\":" << jstr(wsdr::rx_state_name(rs.state))
     << ",\"rx_error\":" << jstr(rs.error) << ",\"last_fault\":" << jstr(rs.last_fault)
-    << ",\"mode\":\"" << modes[static_cast<int>(_mode)] << "\",\"freq_hz\":" << _req_hz
-    << ",\"watch_hz\":" << _watch_hz << ",\"fs\":" << rs.fs << ",\"banks\":" << _banks.load()
+    << ",\"mode\":\"" << modes[static_cast<int>(_mode)] << "\",\"freq_hz\":" << num(_req_hz)
+    << ",\"watch_hz\":" << num(_watch_hz) << ",\"fs\":" << num(rs.fs) << ",\"banks\":" << _banks.load()
     << ",\"dropped\":" << _dropped.load() << ",\"decode_dropped\":" << _ddropped.load()
-    << ",\"restarts\":" << rs.restarts << ",\"dsp_load\":" << _load << ",\"decode_load\":" << _dload;
-  if (_mode == Mode::Scan) o << ",\"scan_step\":" << _step << ",\"scan_steps\":" << _plan.size();
+    << ",\"stream_dropped\":" << rs.mid_drops
+    << ",\"restarts\":" << rs.restarts << ",\"dsp_load\":" << num(_load) << ",\"decode_load\":" << num(_dload);
+  if (_mode == Mode::Scan) o << ",\"scan_step\":" << _step.load() << ",\"scan_steps\":" << _plan_n.load();
   o << ",\"video\":{\"locked\":" << (!_vstats.acquiring && _vstats.lock_recent > 0.5f ? "true" : "false")
-    << ",\"lock\":" << _vstats.lock_recent << ",\"std\":" << jstr(_vstats.std_name) << ",\"fps\":" << _fps
+    << ",\"lock\":" << num(_vstats.lock_recent) << ",\"std\":" << jstr(_vstats.std_name) << ",\"fps\":" << num(_fps)
     << ",\"acquisitions\":" << _vstats.acquisitions << ",\"losses\":" << _vstats.losses
     << ",\"rephases\":" << _vstats.rephases << ",\"clicks_repaired\":" << _vstats.clicks_repaired
     << ",\"lines_kept\":" << _vstats.lines_kept << ",\"colour\":" << (_vstats.colour ? "true" : "false") << "}";
   {
     const auto &d = _comb_status.s;
-    o << ",\"antennas\":{\"combine\":" << (_comb_status.on ? "true" : "false") << ",\"snr_a\":" << d.snr_a_db
-      << ",\"snr_b\":" << d.snr_b_db << ",\"snr_c\":" << d.snr_c_db << ",\"b_share\":" << d.b_share
-      << ",\"a_fade\":" << d.a_fade << ",\"rescued\":" << d.rescued << ",\"coherence\":" << d.coherence << "}";
+    o << ",\"antennas\":{\"combine\":" << (_comb_status.on ? "true" : "false") << ",\"snr_a\":" << num(d.snr_a_db)
+      << ",\"snr_b\":" << num(d.snr_b_db) << ",\"snr_c\":" << num(d.snr_c_db) << ",\"b_share\":" << num(d.b_share)
+      << ",\"a_fade\":" << num(d.a_fade) << ",\"rescued\":" << num(d.rescued) << ",\"coherence\":" << num(d.coherence)
+      << ",\"lag\":" << d.lag << ",\"lag_measured\":" << (d.lag_measured ? "true" : "false") << "}";
   }
   o << ",\"pilots\":[";
   const int64_t t = now_ms();
   for (size_t i = 0; i < _pilots.size(); i++) {
     const auto &p = _pilots[i];
-    o << (i ? "," : "") << "{\"mhz\":" << p.mhz << ",\"name\":" << jstr(p.name) << ",\"std\":" << jstr(p.std_name)
-      << ",\"snr\":" << p.snr_db << ",\"age_s\":" << (t - p.seen_ms) / 1000 << "}";
+    o << (i ? "," : "") << "{\"mhz\":" << num(p.mhz) << ",\"name\":" << jstr(p.name) << ",\"std\":" << jstr(p.std_name)
+      << ",\"snr\":" << num(p.snr_db) << ",\"age_s\":" << (t - p.seen_ms) / 1000 << "}";
   }
   o << "]}";
   return o.str();

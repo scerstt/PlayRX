@@ -1,5 +1,10 @@
 // AnalogRX: kepyur's radio (third_party/kepyur/native/radio, GPL-2.0), copied to pick one of several adapters
 // by USB bus/port (open(bus, port)) instead of an Android usbfs fd. Otherwise unchanged.
+// Since brought up to date with fixes from Auburn/fpvDROID (the Android app that carries Play RX's changes): a
+// bank the stream drops is seen as a hole (status "stream_dropped"; the combiner does not carry samples across
+// it), a scan step's capture does not start over for ever on a lossy link, a mode call that lands as a scan ends
+// is not overridden by that end, and what other threads read while open(), close() and the DSP thread run (the
+// receiver, the scan's progress) is no longer a data race.
 //
 // kepyur radio: one RTL8812BU (wifi-sdr Receiver) + a DSP thread. Modes:
 //   scan   - sweep the analog FPV bands at 40 MS/s, list pilots (humps that pass a sync check)
@@ -15,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "combine.h"
@@ -79,7 +85,7 @@ public:
   bool is_idle();  // idle() and nothing since
   struct ComboStatus {
     bool on = false;
-    arx::Combiner::Stats s;  // the last second
+    arx::Combiner::Stats s;  // the last second; the time offset between the paths as of its end
   };
 
   std::string status_json();   // for the UI (polled)
@@ -131,6 +137,7 @@ private:
   double _dec_t = 0;  // decode thread: arrival of the block being decoded (stamped on its lines)
   void lowlat_thread();  // the calling thread into / out of the Pro Audio class as _lowlat changes
   std::unique_ptr<wsdr::Receiver> _rx;
+  std::mutex _rxm;  // _rx itself (open and close replace it; status_json reads it from another thread)
   mutable std::mutex _m;  // mode, pilots, status fields below
   Mode _mode = Mode::Idle;
   uint64_t _mode_epoch = 0;  // bumped on every mode change; the DSP thread restarts its state
@@ -153,6 +160,7 @@ private:
 
   std::thread _dsp;
   std::atomic<bool> _stop{false};
+  std::atomic<bool> _started{false};  // open() has the receiver started: only then can it be found stopped
 
   // decode thread: watch mode runs demod on the DSP thread and the video decoder here (two cores)
   struct DBlock {
@@ -173,6 +181,7 @@ private:
   uint64_t _epoch_seen = ~0ull;
   std::shared_ptr<FrontEnd> _fe;
   uint32_t _fe_gen = ~0u;
+  uint64_t _watch_seq = 0;  // the last bank this watch took (with _fe_gen: does the next one follow on from it?)
   double _fe_fs = 0, _fe_shift = 0;
   std::vector<cf> _iq, _iqb;
   // two-antenna video
@@ -183,9 +192,15 @@ private:
   ComboStatus _comb_status;  // under _m
   // scan
   std::vector<double> _plan;
-  size_t _step = 0;
+  size_t _at = 0;  // the step the scan is on
+  // The scan's progress as status_json() shows it (_step: _at, _plan_n: _plan.size()). Atomic: read there while
+  // the DSP thread moves it on, and set back to the start by scan() for the status to show until that thread
+  // takes the new scan up.
+  std::atomic<size_t> _step{0}, _plan_n{0};
   int _settle = 0;
   uint64_t _cap_last_seq = 0;
+  uint32_t _cap_gen = 0;
+  int _cap_restarts = 0;  // of this step's capture, after a gap
   std::vector<std::complex<int16_t>> _cap;
   size_t _cap_need = 0;
   double _cap_centre = 0;

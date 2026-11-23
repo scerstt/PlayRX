@@ -1,0 +1,163 @@
+diff --git a/native/dsp/video.cpp b/native/dsp/video.cpp
+index 5ed3936..72b1fcc 100644
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -70,6 +70,11 @@ struct Biquad {  // RBJ low-pass
+     z2 = b2 * x - a2 * y;
+     return y;
+   }
++  // For a filter that is being fed zeros: once its state has died away to nothing (far below anything that could
++  // reach a pixel), make it exactly zero, before it gets down to denormal numbers.
++  void settle() {
++    if (std::fabs(z1) < 1e-25f && std::fabs(z2) < 1e-25f) z1 = z2 = 0;
++  }
+ };
+ 
+ }  // namespace
+@@ -195,6 +200,14 @@ public:
+       luma_ring[n & ring_mask] = luma_notch.run(lp_luma2.run(lp_luma.run(d)));
+     }
+     if (o.colour) {
++      // While the adaptive comb's fade is complete (a whole line under a horizontal edge; the first picture line
++      // of every field too: top_line() works that line's colour out again afterwards, with filters of its own,
++      // but this one still runs through the line here) the chroma low-pass is fed exact zeros, and within a few
++      // hundred samples its state decays into denormal numbers, which x86 computes some hundred times slower.
++      // Looked at every 64 samples, it never gets that far.
++      if (cfade < 1.f) chroma_quiet = 0;
++      else if ((++chroma_quiet & 63) == 0)
++        for (Biquad *b : {&cl_r1, &cl_r2, &cl_i1, &cl_i2}) b->settle();
+       // the oscillator's phase belongs to the absolute sample index: burst and picture share it
+       const cf c = (comb_on ? csrc : d) * (1.f - cfade) * std::conj(lo);  // AnalogRX adaptive comb: combed colour, faded at OSD edges
+       lo *= lo_step;
+@@ -273,6 +286,7 @@ private:
+   std::vector<float> lf_ring;
+   std::vector<float> d_ring;  // the discriminator output (colour comb)
+   float vdiff = 0, cfade = 0, csrc = 0;
++  int chroma_quiet = 0;  // samples in a row with the colour faded out completely
+   bool comb_mode = true, comb_on = false;
+   double cdel_comb = 0;
+   bool low = false, longrun = false;
+@@ -569,7 +583,9 @@ private:
+     if (cur_field < 0) return;
+     const int64_t k = static_cast<int64_t>(line_idx) - field_line0 - std_->skip;
+     if (k < 0 || k >= std_->active) return;
++    const float inv_depth = 1.f / std::max(blank - tip, 0.2f);  // the sync depth as it stood for this line
+     if (locked_line) measure_levels(ls);
++    if (comb_on) top_line(ls, k, inv_depth);
+     const bool rep = repair_on();
+     const bool hit = rep && patch_line(ls);  // AnalogRX sparkle repair: clicks patched; true = still badly hit
+     bool pal_v = false;
+@@ -621,6 +637,83 @@ private:
+     if (o.lines) o.lines(Line{reinterpret_cast<const uint8_t *>(row), o.width, static_cast<int>(k), cur_field, std_->active, std_});
+   }
+ 
++  // The top of the picture with the comb luma. The first picture line of a field has blanking above it, not
++  // picture, and the comb works each line out against the line before. Against blanking it leaves half of the
++  // colour in the brightness as dots, and the adaptive comb, which sees a line that differs all the way along,
++  // fades the colour out as it does under any horizontal edge: the top rows of every frame came out grey. There
++  // is nothing above that line to keep rainbows off, so its picture is worked out again here, from what the
++  // comb's rings hold of it, the way the classic filter does it: brightness through the notch (which the
++  // adaptive comb falls back to there anyway), colour straight from the signal, not faded. Only the picture's
++  // own stretch of that one line is replaced and nothing in push() changes: levels, burst and every other line
++  // come out exactly as they did.
++  // Which line that is depends on the camera and on where the field was found to start: the first drawn row
++  // (k = 0) or one of the next few, with blank rows above it. So it is looked for: the first of rows 0..kTopRows
++  // that has picture (it averages kTopPicture sync depths above blanking or more: the level from which the
++  // adaptive comb starts to see a difference) while every row above it, and the line before row 0, averages
++  // within kTopBlank sync depths of blanking. The second limit is the tighter one on purpose: black picture
++  // sits 7.5 IRE (0.19 sync depths) above blanking, and a row under black rows of picture is a line inside the
++  // picture, which keeps the comb's fade. (A camera that sends black at the blanking level cannot be told
++  // apart this way: under up to kTopRows black rows at the top of its picture, the first brighter row is taken
++  // for the top line and drawn as with the classic filter.) A field that begins with the standard's half line
++  // has it just above row 0 here: then row 0 has blanking above its left half only, and only that half is done
++  // (to the middle, where the half line's picture has begun and the comb is right again). A line further down
++  // that follows a dark line is not touched: there the fade is the adaptive comb's trade.
++  static constexpr int kTopRows = 4;
++  static constexpr float kTopPicture = 0.25f, kTopBlank = 0.10f;
++  void top_line(double ls, int64_t k, float inv_depth) {
++    if (k > kTopRows) return;
++    const double a0 = std_->a0_us * 1e-6 * fs, aw = std_->aw_us * 1e-6 * fs;
++    // no picture over the part [x0, x1) of the width of the line that starts at l?
++    const auto blanking = [&](double l, double x0, double x1, float limit = kTopBlank) {
++      float m;
++      return ring_mean(l + a0 + aw * x0, l + a0 + aw * x1, m) && (m - blank) * inv_depth < limit;
++    };
++    if (blanking(ls, 0, 1, kTopPicture)) return;
++    for (int64_t up = 2; up <= k + 1; up++)  // the rows above the line before, and the line before row 0
++      if (!blanking(ls - static_cast<double>(up) * T, 0, 1)) return;
++    const bool whole = blanking(ls - T, 0, 1);
++    if (!whole && (k > 0 || !blanking(ls - T, 0, 0.4))) return;
++    // The whole line: from the first good point sparkle repair may take (8 samples ahead of the picture) to its
++    // last one in luma (20 after it; those of its chroma patches further on lie in blanking, where there is no
++    // colour either way). The left half: to the middle, the last kBlend samples blended into what push() made.
++    // The filters start kWarm samples ahead, in the sync pulse, and have settled long before the picture.
++    constexpr int kWarm = 128, kBlend = 32;
++    const int64_t s0 = static_cast<int64_t>(ls + a0) - 8;
++    const int64_t s1 = whole ? static_cast<int64_t>(ls + a0 + aw) + 21 : static_cast<int64_t>(ls + a0 + 0.5 * aw);
++    const int64_t back = static_cast<int64_t>(n) - (s0 - kWarm);
++    if (s1 >= static_cast<int64_t>(n) || back > static_cast<int64_t>(ring_mask) - 32) return;
++    const auto fresh = [](Biquad b) {
++      b.z1 = b.z2 = 0;
++      return b;
++    };
++    Biquad nt = fresh(luma_notch_w), r1 = fresh(cl_r1), r2 = fresh(cl_r2), i1 = fresh(cl_i1), i2 = fresh(cl_i2);
++    // Colour: only the adaptive comb takes it from the line difference and fades it (push). Otherwise
++    // chroma_ring already has it straight from the signal. The oscillator (lo, at sample n) turns by w per
++    // sample: back to where it was at the first sample.
++    const bool chroma = o.colour && adaptive_comb_on();
++    const double w = 2 * M_PI * (315e6 / 88) / fs;  // the comb runs on NTSC only
++    const std::complex<double> was = std::polar(1.0, -w * static_cast<double>(back));
++    cf osc = lo * cf(static_cast<float>(was.real()), static_cast<float>(was.imag()));
++    // push()'s line difference reads the line before between two samples (T back: ceil(T) samples, then
++    // ceil(T) - T of the way to the next one), which takes 3 % off the subcarrier and turns it by half a
++    // degree. The burst went through it and the picture's colour is measured against the burst, so this line's
++    // colour gets the same, or it would come out that much more saturated than the rest: half of (1 - the
++    // subcarrier as read there).
++    const double up = std::ceil(T), fr = up - T;
++    const std::complex<double> prev = std::polar(1.0, -w * std::max(up, 1.0)) * ((1.0 - fr) + fr * std::polar(1.0, w));
++    const cf gain(static_cast<float>(0.5 * (1.0 - prev.real())), static_cast<float>(-0.5 * prev.imag()));
++    for (int64_t i = s0 - kWarm; i < s1; i++) {
++      const float y = nt.run(wide_ring[i & ring_mask]);
++      const float mix = whole ? 1.f : std::min(1.f, static_cast<float>(s1 - i) * (1.f / kBlend));
++      if (i >= s0) luma_ring[i & ring_mask] += (y - luma_ring[i & ring_mask]) * mix;
++      if (!chroma) continue;
++      const cf c = d_ring[i & ring_mask] * std::conj(osc);
++      osc *= lo_step;
++      const cf uv(r2.run(r1.run(c.real())), i2.run(i1.run(c.imag())));
++      if (i >= s0) chroma_ring[i & ring_mask] += (uv * gain - chroma_ring[i & ring_mask]) * mix;
++    }
++  }
++
+   // AnalogRX sparkle repair: up to 3 badly hit rows in a row are redrawn from the good rows above and below
+   // them in the same field (blended by distance), once the row below has come in. Nothing older is used, so
+   // there is no tearing in motion; a longer run is left as it is.
+@@ -688,19 +781,23 @@ private:
+     return too_long || lost > 0.08 * aw;
+   }
+ 
+-  float ring_mean(double from, double to) {
++  // The mean of luma_ring over [from, to) into out; false when that stretch is not in the ring. (Not a NaN
++  // return: this file is built with -ffast-math, under which a test for NaN may be compiled away.)
++  bool ring_mean(double from, double to, float &out) {
+     const int64_t i0 = static_cast<int64_t>(from), i1 = static_cast<int64_t>(to);
+-    if (i1 >= static_cast<int64_t>(n) || static_cast<int64_t>(n) - i0 > static_cast<int64_t>(ring_mask)) return NAN;
++    if (i1 >= static_cast<int64_t>(n) || static_cast<int64_t>(n) - i0 > static_cast<int64_t>(ring_mask)) return false;
+     float s = 0;
+     for (int64_t i = i0; i < i1; i++) s += luma_ring[i & ring_mask];
+-    return sign * s / static_cast<float>(i1 - i0);
++    out = sign * s / static_cast<float>(i1 - i0);
++    return true;
+   }
+ 
+   void measure_levels(double ls) {
+     const double us = 1e-6 * fs;
+-    const float t = ring_mean(ls + 1.2 * us, ls + 3.6 * us);  // hsync is 4.7 us
+-    const float b = ring_mean(ls + 5.8 * us, ls + 8.8 * us);  // back porch (burst averages out)
+-    if (std::isnan(t) || std::isnan(b) || b - t < 0.05f) return;
++    float t, b;
++    if (!ring_mean(ls + 1.2 * us, ls + 3.6 * us, t)) return;  // hsync is 4.7 us
++    if (!ring_mean(ls + 5.8 * us, ls + 8.8 * us, b)) return;  // back porch (burst averages out)
++    if (b - t < 0.05f) return;
+     const float a = gated_lines < 64 ? 0.1f : 1.f / 64;
+     tip += a * (t - tip);
+     blank += a * (b - blank);

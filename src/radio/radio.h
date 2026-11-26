@@ -72,6 +72,10 @@ public:
   // AnalogRX: two-antenna video: true = paths A and B combined before demodulation (combine.h), false = A only.
   // Takes effect at once (no retune).
   void set_combine(bool on);
+  // HD picture (steady picture, channel filter) and Sharp OSD (clean colour at sharp edges, still weave); any thread
+  void set_hd(bool on) { _hd = on; }
+  bool hd() const { return _hd; }
+  void set_sharp_osd(bool on) { _osd = on; }
   // AnalogRX low latency (this radio feeds the low latency window): whole pictures built on a thread of their own,
   // the bank and decode queues kept short (a backlog is dropped, not drawn late) and the USB, DSP and decode threads
   // in the "Pro Audio" class (Windows). Takes effect at once.
@@ -149,7 +153,7 @@ private:
   std::deque<Bank> _q;
   std::vector<std::vector<uint8_t>> _pool;
   size_t _qcap = 512;  // 100 ms at 40 MS/s
-  std::atomic<uint64_t> _banks{0}, _dropped{0};
+  std::atomic<uint64_t> _banks{0}, _dropped{0}, _bytes{0};  // _bytes: IQ bytes from USB (speed test)
 
   std::thread _dsp;
   std::atomic<bool> _stop{false};
@@ -177,6 +181,7 @@ private:
   std::vector<cf> _iq, _iqb;
   // two-antenna video
   std::atomic<bool> _combine{false};
+  std::atomic<bool> _hd{false}, _osd{false};
   bool _combine_was = false;  // DSP thread: what the last bank did (reset the combiner on a change)
   arx::Combiner _comb;
   int64_t _comb_t0_ms = 0;

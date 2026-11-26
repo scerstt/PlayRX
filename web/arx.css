@@ -479,6 +479,7 @@ body.node-mode .league-only:not([data-view="timing"]), body.node-mode #nav .nav-
 .rc-heat > div:first-child { display: flex; gap: var(--s2); align-items: center; }
 .rc-heat.on { border-color: rgba(245, 179, 1, .5); background: var(--surface-2); }
 .rc-heat.next { border-color: var(--border-strong); }
+.rc-heat.wait { border-style: dashed; color: var(--text-3); }
 .rc-casual { border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
 .rc-wins { font: 600 var(--fs-xl) var(--font-display); margin-left: var(--s2); }
 .rc-wins.won { color: var(--accent); }
@@ -786,3 +787,7 @@ body.fd .toast { bottom: calc(76px + env(safe-area-inset-bottom)); }
 .heat-laps-k:first-child { margin-top: 0; }
 .blaps { margin-top: var(--s3); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s2) var(--s3); }
 .blaps .heat-laps { border-top: 0; padding: var(--s2) 0 0; }
+
+/* Settings -> Receivers -> USB check */
+.ok-t { color: var(--good); }
+.warn-t { color: var(--warn); }

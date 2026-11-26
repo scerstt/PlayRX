@@ -117,6 +117,11 @@ std::vector<AdapterInfo> list_adapters() {
 
 namespace wsdr {
 
+// USB 3 recovery: nothing to recover in the simulation; kept so the switch reads back
+static std::atomic<bool> g_usb3_recovery{true};
+void set_usb3_recovery(bool on) { g_usb3_recovery = on; }
+bool usb3_recovery() { return g_usb3_recovery.load(); }
+
 const char *rx_state_name(RxState s) {
   switch (s) {
   case RxState::Closed: return "closed";

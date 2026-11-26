@@ -99,7 +99,7 @@ if(WIN32)
   set(APP_INCLUDES src/capture src/vcam src/lowlat src/stream src/platform src/radio src/feeds src/sim src/timing)
   # the window: WebView2 through webview (header-only, MSYS2 mingw-w64-ucrt-x86_64-webview)
   set(APP_LIBS kepyur_dsp wsdrcore user32 shell32 ws2_32 windowscodecs ole32 oleaut32 advapi32 shlwapi version bcrypt winmm
-               mf mfplat mfreadwrite mfuuid uuid strmiids d3d11 dxgi)
+               mf mfplat mfreadwrite mfuuid uuid strmiids d3d11 dxgi setupapi cfgmgr32 powrprof)
 
   add_executable(PlayRX WIN32 ${APP_COMMON} src/radio/adapters.cpp)
   add_executable(PlayRX_sim WIN32 ${APP_COMMON} ${SIM_SOURCES})

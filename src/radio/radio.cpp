@@ -116,6 +116,7 @@ void Radio::open(int bus, const std::string &port) {
     _req_rate = s.rate_sel;
   }
   _banks = 0;
+  _bytes = 0;
   _dropped = 0;
   _stop = false;
   _rx = std::move(rx);
@@ -180,6 +181,7 @@ void Radio::on_bank(const uint8_t *b, size_t n, uint64_t seq, uint32_t gen, doub
     _q.push_back(Bank{std::move(v), seq, gen, fs, centre, shift, t_s});
   }
   _banks++;
+  _bytes += n;
   _qcv.notify_one();
 }
 
@@ -427,6 +429,12 @@ void Radio::handle_watch(Bank &b) {
     KP_LOGW("radio: stream restarted (gen %u, %s), decoder keeps going", b.gen, why.c_str());
   }
   _fe_gen = b.gen;
+  {  // HD (steady picture, channel filter) and Sharp OSD (clean colour at sharp edges, still weave)
+    PictureOpts po;
+    po.denoise = po.channel_filter = _hd.load();
+    po.edge_colour = po.still_weave = _osd.load();
+    _fe->set_picture(po);
+  }
   unpack(b, _iq);
   const bool comb = _combine.load();
   unpack_b(b, _iqb);  // always: cheap
@@ -834,9 +842,11 @@ std::string Radio::status_json() {
     << ",\"chip\":" << jstr(_chip) << ",\"rx_state\":" << jstr(wsdr::rx_state_name(rs.state))
     << ",\"rx_error\":" << jstr(rs.error) << ",\"last_fault\":" << jstr(rs.last_fault)
     << ",\"mode\":\"" << modes[static_cast<int>(_mode)] << "\",\"freq_hz\":" << _req_hz
-    << ",\"watch_hz\":" << _watch_hz << ",\"fs\":" << rs.fs << ",\"banks\":" << _banks.load()
+    << ",\"watch_hz\":" << _watch_hz << ",\"fs\":" << rs.fs << ",\"banks\":" << _banks.load() << ",\"bytes\":" << _bytes.load()
     << ",\"dropped\":" << _dropped.load() << ",\"decode_dropped\":" << _ddropped.load()
-    << ",\"restarts\":" << rs.restarts << ",\"dsp_load\":" << _load << ",\"decode_load\":" << _dload;
+    << ",\"restarts\":" << rs.restarts << ",\"rx_banks\":" << rs.banks << ",\"unwedged\":" << rs.unwedged
+    << ",\"mid_drops\":" << rs.mid_drops << ",\"start_drops\":" << rs.start_late_skips
+    << ",\"start_retries\":" << rs.start_retries << ",\"gapped\":" << (rs.gapped ? "true" : "false") << ",\"dsp_load\":" << _load << ",\"decode_load\":" << _dload;
   if (_mode == Mode::Scan) o << ",\"scan_step\":" << _step << ",\"scan_steps\":" << _plan.size();
   o << ",\"video\":{\"locked\":" << (!_vstats.acquiring && _vstats.lock_recent > 0.5f ? "true" : "false")
     << ",\"lock\":" << _vstats.lock_recent << ",\"std\":" << jstr(_vstats.std_name) << ",\"fps\":" << _fps

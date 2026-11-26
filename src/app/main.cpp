@@ -46,6 +46,7 @@ extern char **environ;
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -75,6 +76,7 @@ extern char **environ;
 #include "capture.h"
 #include "net_feed.h"
 #include "timing.h"
+#include "usb_info.h"  // USB check: host controller, power source and plan
 #ifdef ANALOGRX_SIM
 #include "sim.h"
 #endif
@@ -241,10 +243,14 @@ struct Settings {
   bool offset_tune = true;  // tune each receiver ~4 MHz beside its pilot (off the chip's DC point: no edge stripes)
   bool acomb = true;        // adaptive comb: clean OSD text (no halo, no rainbow edges); NTSC with the comb filter on
   bool smooth_lines = true; // each field's lines in place, the lines between interpolated (no stair-steps, no bobbing)
+  bool hd = false;          // HD picture on every feed (Live view's HD button): steady picture, channel filter
+  bool sharp_osd = true;    // Sharp OSD (Settings -> Picture): clean colour at sharp edges + still weave (full vertical detail where still)
+  bool usb3_recovery = true; // USB 3 recovery (Settings -> Receivers): free a locked-up adapter USB link in place (wsdr::set_usb3_recovery)
   // a race without a heat loaded (Start race on whoever is in the slots): its format
   std::string quick_mode = "laps";  // laps (first to N, the default) | practice | timed | best3
   int quick_laps = 3;
   int quick_time = 120;  // s
+  bool quick_cap = false;  // first to N laps: the race also stops at quick_time (whoever is ahead then wins)
   int64_t pin_league = 0;  // the league pinned to the Dashboard (0 none)
   // OBS scene switching (obs-websocket, built into OBS 28+), driven from the app window
   bool obs_on = false;
@@ -571,8 +577,8 @@ void save_settings() {
   const Settings &s = g_settings;
   std::ostringstream f;
   f << "# AnalogRX settings\nbands=" << s.bands << "\nlan=" << s.lan << "\nguided=" << s.guided << "\nauto_gate=" << s.auto_gate << "\npasses=" << s.passes
-    << "\nvoice=" << s.voice << "\nvolume=" << s.volume << "\nrate=" << s.rate << "\npitch=" << s.pitch << "\nvoice_id=" << s.voice_id << "\nprecheck=" << s.precheck << "\ntiming_only=" << s.timing_only << "\nts_on=" << s.ts_on << "\nts_host=" << s.ts_host << "\nts_port=" << s.ts_port << "\nts_fps=" << s.ts_fps << "\nts_kbps=" << s.ts_kbps << "\nts_bars=" << s.ts_bars << "\nvcam_mask=" << s.vcam_mask << "\ntiming_wide=" << s.timing_wide << "\nportable=" << s.portable << "\ncall_laps=" << s.call_laps << "\nmsps=" << s.msps << "\ndiversity=" << s.diversity << "\nrepair=" << s.repair << "\noffset_tune=" << s.offset_tune << "\nacomb=" << s.acomb << "\nsmooth_lines=" << s.smooth_lines << "\ncomb=" << s.comb << "\nquick_mode=" << s.quick_mode << "\nquick_laps=" << s.quick_laps
-    << "\nquick_time=" << s.quick_time << "\npin_league=" << s.pin_league << "\nobs_on=" << s.obs_on << "\nobs_url=" << s.obs_url << "\nobs_pass=" << s.obs_pass
+    << "\nvoice=" << s.voice << "\nvolume=" << s.volume << "\nrate=" << s.rate << "\npitch=" << s.pitch << "\nvoice_id=" << s.voice_id << "\nprecheck=" << s.precheck << "\ntiming_only=" << s.timing_only << "\nts_on=" << s.ts_on << "\nts_host=" << s.ts_host << "\nts_port=" << s.ts_port << "\nts_fps=" << s.ts_fps << "\nts_kbps=" << s.ts_kbps << "\nts_bars=" << s.ts_bars << "\nvcam_mask=" << s.vcam_mask << "\ntiming_wide=" << s.timing_wide << "\nportable=" << s.portable << "\ncall_laps=" << s.call_laps << "\nmsps=" << s.msps << "\ndiversity=" << s.diversity << "\nrepair=" << s.repair << "\noffset_tune=" << s.offset_tune << "\nacomb=" << s.acomb << "\nsmooth_lines=" << s.smooth_lines << "\nhd=" << s.hd << "\nsharp_osd=" << s.sharp_osd << "\nusb3_recovery=" << s.usb3_recovery << "\ncomb=" << s.comb << "\nquick_mode=" << s.quick_mode << "\nquick_laps=" << s.quick_laps
+    << "\nquick_time=" << s.quick_time << "\nquick_cap=" << s.quick_cap << "\npin_league=" << s.pin_league << "\nobs_on=" << s.obs_on << "\nobs_url=" << s.obs_url << "\nobs_pass=" << s.obs_pass
     << "\nscene_pre=" << s.scene_pre << "\nscene_race=" << s.scene_race << "\nscene_results=" << s.scene_results
     << "\nrh_on=" << s.rh_on << "\nrh_url=" << s.rh_url << "\nrh_user=" << s.rh_user << "\nrh_pass=" << s.rh_pass << "\nrh_sync=" << s.rh_sync
     << "\nrh_control=" << s.rh_control << "\nrh_mode=" << s.rh_mode << "\nnode_mode=" << s.node_mode << "\nnode_name=" << s.node_name
@@ -608,6 +614,12 @@ void load_settings() {
       g_settings.acomb = v == "1";
     } else if (k == "smooth_lines") {
       g_settings.smooth_lines = v == "1";
+    } else if (k == "hd") {
+      g_settings.hd = v == "1";
+    } else if (k == "sharp_osd") {
+      g_settings.sharp_osd = v == "1";
+    } else if (k == "usb3_recovery") {
+      g_settings.usb3_recovery = v == "1";
     } else if (k == "passes") {
       g_settings.passes = std::clamp(std::atoi(v.c_str()), 1, 5);
     } else if (k == "voice") {
@@ -642,6 +654,8 @@ void load_settings() {
       g_settings.pin_league = std::atoll(v.c_str());
     } else if (k == "quick_time") {
       g_settings.quick_time = std::clamp(std::atoi(v.c_str()), 10, 900);
+    } else if (k == "quick_cap") {
+      g_settings.quick_cap = v == "1";
     } else if (k == "obs_on") {
       g_settings.obs_on = v == "1";
     } else if (k == "ts_on") {
@@ -703,8 +717,8 @@ std::string settings_json() {
   o << "],\"lan\":" << b(s.lan) << ",\"lan_active\":" << b(g_app.lan) << ",\"port\":" << g_feeds.port()
     << ",\"guided\":" << b(s.guided) << ",\"auto_gate\":" << b(s.auto_gate)
     << ",\"passes\":" << s.passes << ",\"voice\":" << b(s.voice)
-    << ",\"volume\":" << s.volume << ",\"rate\":" << s.rate << ",\"pitch\":" << s.pitch << ",\"voice_id\":" << q(s.voice_id) << ",\"precheck\":" << q(s.precheck) << ",\"timing_only\":" << b(s.timing_only) << ",\"timing_wide\":" << b(s.timing_wide) << ",\"portable\":" << b(s.portable) << ",\"call_laps\":" << b(s.call_laps) << ",\"msps\":" << s.msps << ",\"diversity\":" << b(s.diversity) << ",\"repair\":" << b(s.repair) << ",\"offset_tune\":" << b(s.offset_tune) << ",\"acomb\":" << b(s.acomb) << ",\"smooth_lines\":" << b(s.smooth_lines) << ",\"comb\":" << b(s.comb) << ",\"quick_mode\":" << q(s.quick_mode)
-    << ",\"quick_laps\":" << s.quick_laps << ",\"quick_time\":" << s.quick_time << ",\"pin_league\":" << s.pin_league << ",\"obs_on\":" << b(s.obs_on)
+    << ",\"volume\":" << s.volume << ",\"rate\":" << s.rate << ",\"pitch\":" << s.pitch << ",\"voice_id\":" << q(s.voice_id) << ",\"precheck\":" << q(s.precheck) << ",\"timing_only\":" << b(s.timing_only) << ",\"timing_wide\":" << b(s.timing_wide) << ",\"portable\":" << b(s.portable) << ",\"call_laps\":" << b(s.call_laps) << ",\"msps\":" << s.msps << ",\"diversity\":" << b(s.diversity) << ",\"repair\":" << b(s.repair) << ",\"offset_tune\":" << b(s.offset_tune) << ",\"acomb\":" << b(s.acomb) << ",\"smooth_lines\":" << b(s.smooth_lines) << ",\"hd\":" << b(s.hd) << ",\"sharp_osd\":" << b(s.sharp_osd) << ",\"usb3_recovery\":" << b(s.usb3_recovery) << ",\"comb\":" << b(s.comb) << ",\"quick_mode\":" << q(s.quick_mode)
+    << ",\"quick_laps\":" << s.quick_laps << ",\"quick_time\":" << s.quick_time << ",\"quick_cap\":" << b(s.quick_cap) << ",\"pin_league\":" << s.pin_league << ",\"obs_on\":" << b(s.obs_on)
     << ",\"ts_on\":" << b(s.ts_on) << ",\"ts_host\":" << q(s.ts_host) << ",\"ts_port\":" << s.ts_port << ",\"ts_fps\":" << s.ts_fps << ",\"ts_kbps\":" << s.ts_kbps << ",\"ts_bars\":" << b(s.ts_bars) << ",\"vcam_mask\":" << s.vcam_mask
     << ",\"obs_url\":" << q(s.obs_url) << ",\"obs_pass_set\":" << b(!s.obs_pass.empty()) << ",\"scene_pre\":" << q(s.scene_pre)
     << ",\"scene_race\":" << q(s.scene_race) << ",\"scene_results\":" << q(s.scene_results)
@@ -745,6 +759,18 @@ void apply_settings(const std::string &body) {
     s.smooth_lines = jbool(body, "smooth_lines");
     kp::set_smooth_lines(s.smooth_lines);
     KP_LOGI("smooth lines %s", s.smooth_lines ? "on" : "off");
+  }
+  if (jhas(body, "sharp_osd")) {
+    s.sharp_osd = jbool(body, "sharp_osd");
+    KP_LOGI("sharp OSD %s", s.sharp_osd ? "on" : "off");  // the radios pick it up on the next tick
+  }
+  if (jhas(body, "usb3_recovery")) {
+    s.usb3_recovery = jbool(body, "usb3_recovery");
+    KP_LOGI("USB 3 recovery %s", s.usb3_recovery ? "on" : "off");  // each receiver picks it up at its next stream start
+  }
+  if (jhas(body, "hd")) {
+    s.hd = jbool(body, "hd");
+    KP_LOGI("HD picture %s", s.hd ? "on" : "off");  // the radios pick it up on the next tick
   }
   if (jhas(body, "acomb")) {
     s.acomb = jbool(body, "acomb");
@@ -800,6 +826,7 @@ void apply_settings(const std::string &body) {
   if (jhas(body, "pin_league")) s.pin_league = std::max<int64_t>(0, static_cast<int64_t>(jnum(body, "pin_league")));
   if (jhas(body, "quick_laps")) s.quick_laps = std::clamp(static_cast<int>(jnum(body, "quick_laps")), 1, 20);
   if (jhas(body, "quick_time")) s.quick_time = std::clamp(static_cast<int>(jnum(body, "quick_time")), 10, 900);
+  if (jhas(body, "quick_cap")) s.quick_cap = jbool(body, "quick_cap");
   auto line = [](std::string v) {  // one line in settings.cfg
     for (char &c : v)
       if (c == '\n' || c == '\r' || c == '\t') c = ' ';
@@ -1637,11 +1664,14 @@ void poll_status() {
     next_scan = now_ms() + 5000;
     refresh_adapters();  // no-op while one is still running
   }
+  wsdr::set_usb3_recovery(g_settings.usb3_recovery);  // read by each receiver at its next stream start
   for (int i = 1; i <= kMaxSlots; i++) {
     Slot *s = g_app.slots[i].get();
     if (!s) continue;
     if (s->rx.radio && !s->rx.opening) {
       s->rx.status = s->rx.radio->status_json();
+      s->rx.radio->set_hd(g_settings.hd);  // HD picture (a radio can move between slots: set every tick)
+      s->rx.radio->set_sharp_osd(g_settings.sharp_osd);
       // the adapter went away (unplugged): give it up and look again
       const std::string st = jstr(s->rx.status, "rx_state");
       if (st == "lost" || st == "error") {
@@ -1943,6 +1973,126 @@ std::string share_note(int n) {
          "Plug in another adapter, or move pilots onto channels closer together.";
 }
 
+// ---- USB check (Settings -> Receivers): how well each open adapter's USB stream keeps up on this PC ----
+// Start: a snapshot of every streaming adapter's counters; while it runs and after: the change since then, against
+// what the chip sent (fs / 8192 banks a second). Nothing is stopped or retuned: it measures the streams as they are.
+// The report line is for users to send in (controller, power, rate, recovery switch, per-adapter results).
+struct UsbCheckAdapter {
+  std::string id, name, controller;
+  bool usb3 = false;
+  int slot = 0;
+  double rx_banks = 0, restarts = 0, unwedged = 0, mid_drops = 0, start_drops = 0;  // at the start
+};
+struct UsbCheck {
+  bool ran = false;
+  int64_t t0_ms = 0, t_end_ms = 0;
+  std::vector<UsbCheckAdapter> adapters;
+  arx::PowerInfo power;
+  std::string cpu;
+} g_usbcheck;
+
+void usb_check_start(int seconds) {
+  UsbCheck c;
+  c.ran = true;
+  c.t0_ms = now_ms();
+  c.t_end_ms = c.t0_ms + seconds * 1000LL;
+  c.power = arx::power_info();
+  c.cpu = arx::cpu_name();
+  for (int i = 1; i <= kMaxSlots; i++) {
+    Slot *s = g_app.slots[i].get();
+    if (!s || !s->rx.radio || s->rx.opening || s->rx.adapter.empty()) continue;
+    UsbCheckAdapter a;
+    a.id = s->rx.adapter;
+    a.slot = i;
+    const std::string &j = s->rx.status;
+    a.usb3 = jbool(j, "usb3");
+    a.rx_banks = jnum(j, "rx_banks");
+    a.restarts = jnum(j, "restarts");
+    a.unwedged = jnum(j, "unwedged");
+    a.mid_drops = jnum(j, "mid_drops");
+    a.start_drops = jnum(j, "start_drops");
+    {
+      std::lock_guard<std::mutex> l(g_app.adapters_m);
+      for (const auto &ad : g_app.adapters)
+        if (ad.id() == a.id) {
+          a.name = ad.name;
+          a.controller = arx::usb_controller(ad.vid, ad.pid, ad.port);
+        }
+    }
+    c.adapters.push_back(a);
+  }
+  g_usbcheck = std::move(c);
+  KP_LOGI("USB check: %d s, %zu adapter(s)", seconds, g_usbcheck.adapters.size());
+}
+
+std::string usb_check_json() {
+  const UsbCheck &c = g_usbcheck;
+  const int64_t now = now_ms();
+  const bool running = c.ran && now < c.t_end_ms;
+  const double secs = c.ran ? (std::min(now, c.t_end_ms) - c.t0_ms) / 1000.0 : 0;
+  std::ostringstream o, line;
+  char buf[256];
+#ifdef _WIN32
+  const char *os = "Windows";
+#elif defined(__APPLE__)
+  const char *os = "macOS";
+#else
+  const char *os = "Linux";
+#endif
+  line << kProduct << " " << kVersion << " | " << os;
+  if (!c.cpu.empty()) line << " | " << c.cpu;
+  if (!c.power.source.empty()) line << " | " << c.power.source;
+  if (!c.power.plan.empty()) line << ", plan " << c.power.plan;
+  if (!c.power.mode.empty()) line << ", mode " << c.power.mode;
+  line << " | " << g_settings.msps << " MS/s, USB 3 recovery " << (g_settings.usb3_recovery ? "on" : "off") << " | " << std::fixed
+       << std::setprecision(0) << secs << " s";
+  o << "{\"ran\":" << (c.ran ? "true" : "false") << ",\"running\":" << (running ? "true" : "false")
+    << ",\"seconds\":" << secs << ",\"left\":" << (running ? (c.t_end_ms - now) / 1000.0 : 0)
+    << ",\"power\":" << q(c.power.source) << ",\"plan\":" << q(c.power.plan) << ",\"mode\":" << q(c.power.mode)
+    << ",\"cpu\":" << q(c.cpu) << ",\"adapters\":[";
+  bool first = true;
+  for (const auto &a : c.adapters) {
+    Slot *s = a.slot >= 1 && a.slot <= kMaxSlots ? g_app.slots[a.slot].get() : nullptr;
+    const bool same = s && s->rx.radio && !s->rx.opening && s->rx.adapter == a.id;
+    const std::string j = same ? s->rx.status : std::string();
+    const double fs = jnum(j, "fs");
+    const bool gapped = jbool(j, "gapped");
+    const double got = same ? jnum(j, "rx_banks") - a.rx_banks : 0;
+    const double expect = fs > 0 && !gapped ? fs / 8192.0 * secs : 0;
+    const double pct = expect > 0 ? std::min(100.0, 100.0 * got / expect) : -1;
+    const double restarts = same ? jnum(j, "restarts") - a.restarts : 0;
+    const double unwedged = same ? jnum(j, "unwedged") - a.unwedged : 0;
+    const double drops = same ? jnum(j, "mid_drops") - a.mid_drops + jnum(j, "start_drops") - a.start_drops : 0;
+    const std::string fault = jstr(j, "last_fault");
+    const std::string label = g_adapter_names.count(a.id) ? g_adapter_names[a.id] : std::string();
+    o << (first ? "" : ",") << "{\"id\":" << q(a.id) << ",\"name\":" << q(a.name) << ",\"label\":" << q(label)
+      << ",\"slot\":" << a.slot << ",\"usb3\":" << (a.usb3 ? "true" : "false") << ",\"controller\":" << q(a.controller)
+      << ",\"streaming\":" << (same && jstr(j, "rx_state") == "streaming" ? "true" : "false")
+      << ",\"gone\":" << (same ? "false" : "true") << ",\"gapped\":" << (gapped ? "true" : "false")
+      << ",\"fs\":" << fs << ",\"pct\":" << pct << ",\"restarts\":" << restarts << ",\"unwedged\":" << unwedged
+      << ",\"drops\":" << drops << ",\"last_fault\":" << q(fault) << "}";
+    first = false;
+    line << "\n  " << a.id << (kRx ? " (feed " : " (pilot ") << a.slot << ") USB " << (a.usb3 ? "3" : "2");
+    if (!a.controller.empty()) line << ", " << a.controller;
+    if (!same) {
+      line << ": adapter released during the check";
+      continue;
+    }
+    if (pct >= 0) {
+      std::snprintf(buf, sizeof buf, ": %.1f%% of samples", pct);
+      line << buf;
+    } else {
+      line << (gapped ? ": gapped (timing only)" : ": not streaming");
+    }
+    line << ", " << static_cast<long long>(restarts) << " restarts, " << static_cast<long long>(drops) << " banks dropped, "
+         << static_cast<long long>(unwedged) << " lockups freed";
+    if (!fault.empty() && restarts > 0) line << ", last fault: " << fault;
+  }
+  if (c.ran && c.adapters.empty()) line << "\n  no adapter was open when the check started";
+  o << "],\"report\":" << q(c.ran ? line.str() : std::string()) << "}";
+  return o.str();
+}
+
 std::string state_json() {
   std::ostringstream o;
   o << "{\"edition\":" << q(kRx ? "rx" : "league") << ",\"product\":" << q(kProduct)
@@ -2105,6 +2255,7 @@ void vcam_apply() {  // only the cameras switched on are listed in other program
 void live_apply() {
   g_live.configure(g_settings.ts_on, g_settings.ts_host, g_settings.ts_port, g_settings.ts_fps, g_settings.ts_kbps, g_settings.ts_bars);
 }
+
 
 
 bool api(const std::string &method, const std::string &full, const std::string &body, std::string &status,
@@ -2322,6 +2473,11 @@ bool api(const std::string &method, const std::string &full, const std::string &
       else g_adapter_names[id] = nm;
       save_adapter_names();
       out = "{}";
+    };
+  } else if (path == "/api/usb_check") {  // POST {"seconds": 20} starts it; GET: progress and results so far
+    fn = [&, post] {
+      if (post) usb_check_start(std::clamp(static_cast<int>(jnum(body, "seconds", 20)), 5, 120));
+      out = usb_check_json();
     };
   } else if (post && path == "/api/adapters/rescan") {
     fn = [&] {

@@ -1,5 +1,123 @@
+diff --git a/src/fw/stream8822b.S b/src/fw/stream8822b.S
+index 57c5d0d..1b155a3 100644
+--- a/src/fw/stream8822b.S
++++ b/src/fw/stream8822b.S
+@@ -26,9 +26,12 @@
+ #   +0x00 magic 0x57535431 ("WST1")  +0x04 seq (banks shipped)   +0x08 state (1 = running)
+ #   +0x0C target5 (current bank)     +0x10 t_arm (us)           *+0x14 arm LA (0 = synthetic)
+ #  *+0x18 period5                   *+0x1C guard5               *+0x20 data descriptor word 0
+-#  *+0x24 gapped (1) / continuous (0)
++#  *+0x24 gapped (1) / continuous (0)  *+0x28 us a request may stay pending before an RX DMA pulse (0: never)
++#   +0x2C when the request in hand was written (us)             *+0x30 RX DMA pulses given (seeded 0)
++#  *+0x34 a bank that would start more than this after due is skipped (fifths; 0: never)  *+0x38 banks skipped
+ #  *+0x100, +0x140 bank 0 / 1 records: +0 bank CPU base, +4 + 8k {descriptor CPU addr, request}
+-# Trailer payload (RX SRAM, CPU 0xb8701018): 128 B prefix, then seq, target5, start5, end5.
++# Trailer payload (RX SRAM, CPU 0xb8701018): 128 B prefix, then seq, target5, start5, end5, pulses, when each
++# of the four data packets was taken (5 x REG 0x568), banks skipped.
+         .set    noreorder
+         .set    mips16
+ 
+@@ -45,12 +48,43 @@
+         .endm
+ 
+         # Write the C2H request in v0 and wait for the engine to take the packet (clobbers v0, v1).
++        #
++        # fpvDROID: on some USB 3 hosts the engine now and then never takes a request (the C2H wedge, FINDINGS §4:
++        # 0x294 BIT16 stays set). Switching the RX DMA enables in REG_CR (0x100 bits 1 and 3) off and on lets it
++        # go again (measured from the host on a wedged chip: fpvDROID's wedge lab). So a request still pending
++        # +0x28 us after it was written gets that pulse, counted at +0x30, and the wait starts over. A limit of
++        # 0 waits for ever, as before. The engine takes a 16 KiB packet in 38..49 us.
+         .macro  SEND
+         sw      $2, 0x294($17)
++        lw      $3, 0x568($17)
++        sw      $3, 0x2c($16)           # when the request was written (us)
+ 99:     lw      $2, 0x294($17)
+         lui     $3, 1
+         and     $2, $3
+-        bnez    $2, 99b
++        beqz    $2, 97f                 # taken: done
++        lw      $3, 0x28($16)
++        beqz    $3, 99b                 # no limit
++        lw      $2, 0x568($17)
++        lw      $3, 0x2c($16)
++        subu    $2, $2, $3              # us waited so far
++        lw      $3, 0x28($16)
++        sltu    $2, $3
++        btnez   99b                     # within the limit
++        lbu     $2, 0x100($17)
++        li      $3, 0xf5
++        and     $3, $2
++        sb      $3, 0x100($17)          # HCI_RXDMA_EN and RXDMA_EN off
++        li      $3, 40
++98:     addiu   $3, -1
++        bnez    $3, 98b                 # ~10 us
++        sb      $2, 0x100($17)          # and on again
++        lw      $2, 0x30($16)
++        addiu   $2, 1
++        sw      $2, 0x30($16)           # pulses given
++        lw      $3, 0x568($17)
++        sw      $3, 0x2c($16)
++        b       99b
++97:
+         .endm
+ 
+         .text
+@@ -90,6 +124,30 @@ bank:   lw      $3, 0x24($16)
+         addu    $2, $2, $4
+         sw      $2, 0x0c($16)           # target5 = now5 + period5 + guard5
+ 5:      lw      $5, 0x0c($16)           # a1 = target5
++        # fpvDROID: a bank that would start this late could not go out whole before the ADC comes back to it (the
++        # host sets the limit from that): not shipped. The seq moves on, the count of skipped banks goes in the
++        # trailer, and the next bank goes on time. Without this, after the host stopped reading for a few ms the
++        # program shipped every bank late until it caught up (at 40 MS/s ~34 us a bank on a Pixel 8 Pro), and the
++        # host, dropping them, ended the run.
++        lw      $3, 0x34($16)
++        beqz    $3, 2f
++        NOW5
++        subu    $2, $2, $5              # how late it would start (fifths, signed)
++        lw      $3, 0x34($16)
++        slt     $3, $2                  # T = limit < late
++        bteqz   2f
++        lw      $2, 0x18($16)
++        addu    $5, $5, $2
++        sw      $5, 0x0c($16)           # target5 += period5
++        lw      $2, 4($16)
++        addiu   $2, 1
++        sw      $2, 4($16)              # seq++
++        lw      $2, 0x38($16)
++        addiu   $2, 1
++        sw      $2, 0x38($16)           # banks skipped
++        li      $2, 0x40
++        xor     $7, $2                  # other bank record (continuous only: gapped seeds +0x34 = 0)
++        b       5b
+ 2:      NOW5
+         subu    $2, $2, $5
+         slti    $2, 0                   # T = now5 < target5
+@@ -131,6 +189,11 @@ bank:   lw      $3, 0x24($16)
+         sw      $2, 8($6)               # byte 11 = 0x10: C2H
+         lw      $2, 4($4)
+         SEND
++        NOW5                            # fpvDROID: when this packet was taken, for the host's deadline
++        sll     $6, $5, 2               # a2 = 4 * packets left, 4..1
++        LI32    $3, 0xb87010bc          # trailer stamps + 36
++        subu    $3, $3, $6              # + 20 for packet 0 ... + 32 for packet 3
++        sw      $2, 0($3)
+         addiu   $4, 8
+         addiu   $5, -1
+         bnez    $5, 4b
+@@ -138,6 +201,10 @@ bank:   lw      $3, 0x24($16)
+         NOW5
+         LI32    $6, 0xb8701098
+         sw      $2, 12($6)              # end5
++        lw      $2, 0x30($16)
++        sw      $2, 16($6)              # RX DMA pulses given so far (see SEND)
++        lw      $2, 0x38($16)
++        sw      $2, 36($6)              # banks skipped so far
+         lw      $6, 0($7)
+         LI32    $2, 0xfff8
+         addu    $6, $6, $2              # a2 = last sample of the bank
 diff --git a/src/receiver.cpp b/src/receiver.cpp
-index af47d55..5c0c686 100644
+index 72e29c5..a7dfbe6 100644
 --- a/src/receiver.cpp
 +++ b/src/receiver.cpp
 @@ -3,6 +3,7 @@
@@ -10,7 +128,27 @@ index af47d55..5c0c686 100644
  #include <stdexcept>
  #include <tuple>
  
-@@ -87,7 +88,7 @@ void Receiver::open(uint16_t pid, const RxSettings &initial, int bus, const std:
+@@ -14,6 +15,19 @@ namespace wsdr {
+ 
+ using clk = std::chrono::steady_clock;
+ 
++// fpvDROID: for what holds on Android only (the worker's StreamCfg::unwedge_us)
++#ifdef __ANDROID__
++constexpr bool kAndroid = true;
++#else
++constexpr bool kAndroid = false;
++#endif
++
++// Play League: USB 3 recovery (set_usb3_recovery). On: the onboard program frees a wedged C2H engine in place once
++// this host has wedged an adapter, on every platform, and skips banks too late to go out whole. Off: neither.
++static std::atomic<bool> g_usb3_recovery{true};
++void set_usb3_recovery(bool on) { g_usb3_recovery = on; }
++bool usb3_recovery() { return g_usb3_recovery.load(); }
++
+ const char *rx_state_name(RxState s) {
+   switch (s) {
+   case RxState::Closed: return "closed";
+@@ -87,7 +101,7 @@ void Receiver::open(uint16_t pid, const RxSettings &initial, int bus, const std:
    if (sys_fd >= 0)
      o.reset = false; // a USB reset can re-enumerate the device and invalidate the granted fd
    o.bw = cu && !initial.allow_gapped ? 20 : width_of(initial, cu); // 8812CU at 40 MS/s only gapped
@@ -19,7 +157,7 @@ index af47d55..5c0c686 100644
    o.thermal_track = false; // no host register traffic while streaming
    auto s = std::make_unique<Session>(_log);
    try {
-@@ -171,7 +172,7 @@ void Receiver::set(const RxSettings &s) {
+@@ -171,7 +185,7 @@ void Receiver::set(const RxSettings &s) {
      n.gain_db = std::clamp(n.gain_db, 0.0, _caps.gain_max);
      const auto hw = [&](const RxSettings &x) {
        const int w = width_of(x, _caps.cu);
@@ -28,7 +166,16 @@ index af47d55..5c0c686 100644
      };
      const bool same_hw = hw(n) == hw(_set);
      _set = n;
-@@ -230,7 +231,7 @@ void Receiver::worker() {
+@@ -205,6 +219,8 @@ void Receiver::worker() {
+   } done{this};
+   uint64_t seq = 0;
+   int consecutive_faults = 0;
++  bool unwedge_tried = false; // fpvDROID: the last run ended wedged and this one is its one new start
++  bool wedge_seen = false;    // fpvDROID: a run of this worker ended wedged (StreamCfg::unwedge_us, below)
+   while (_active) {
+     // Let a burst of setter calls settle before restarting.
+     for (;;) {
+@@ -230,7 +246,7 @@ void Receiver::worker() {
        _st.state = RxState::Starting;
      }
      const int width = width_of(cur, _caps.cu);
@@ -37,21 +184,115 @@ index af47d55..5c0c686 100644
      const double fs = rate_of(cur.rate_sel);
      const double centre = centre_of(ch, width);
      try {
-@@ -257,6 +258,9 @@ void Receiver::worker() {
+@@ -257,6 +273,26 @@ void Receiver::worker() {
      c.la.rate_sel = cur.rate_sel;
      // >= 20 MS/s needs ~13 ms of posted URBs; the 8812CU wants ~100 ms (FINDINGS §4)
      c.depth = _caps.cu || cur.rate_sel <= 2 ? 256 : 64;
 +    // AnalogRX: WSDR_URB_DEPTH overrides the posted bulk-IN transfers (Windows tuning experiments)
 +    if (const char *d = std::getenv("WSDR_URB_DEPTH"))
 +      if (std::atoi(d) > 0) c.depth = std::min(4096, std::atoi(d));
++    // fpvDROID: the onboard program frees a wedged C2H engine by itself after this wait (StreamCfg::unwedge_us):
++    //  - on USB 3 only: a packet takes ~350 us on USB 2, which never wedges;
++    //  - on Android only: that is where the wedge is met, and where this was measured;
++    //  - only once this host has wedged the adapter (wedge_seen: a run of this worker ended so, which costs the
++    //    one new start). On a host that does not wedge, the pulse can only fall on a packet that is merely slow,
++    //    which then comes out in pieces.
++    // The measurements are in fpvDROID's patches/c2h-wedge.md. WSDR_WEDGE_US sets the wait instead, from the first
++    // run on and on any host (0: no pulse).
++    // Play League: on Windows, macOS and Linux too while USB 3 recovery is on (set_usb3_recovery)
++    const bool recovery = usb3_recovery();
++    c.unwedge_us = (kAndroid || recovery) && wedge_seen && !_caps.cu && _s->superspeed() ? 100 : 0;
++    c.skip_late = recovery;
++    if (const char *e = std::getenv("WSDR_WEDGE_US"))
++      c.unwedge_us = static_cast<unsigned>(std::max(0, std::atoi(e)));
++    // fpvDROID: WSDR_SKIP=0 has the onboard program ship late banks too (StreamCfg::skip_late)
++    if (const char *e = std::getenv("WSDR_SKIP"))
++      c.skip_late = std::atoi(e) != 0;
      c.la.igi = cur.agc ? -1 : igi_for(cur.gain_db, _caps.cu);
      c.la.no_cca = !cur.agc;
-     c.la.dfir = !_caps.cu && width >= 40 ? width : 0; // 0 leaves devourer's DFIR (8822B: BW20 set; 8822C: per width)
+     // 0 leaves devourer's DFIR (8822B: BW20 set; 8822C: per width). The wide sets only where the rate carries
+@@ -285,15 +321,29 @@ void Receiver::worker() {
+       _st.gapped = c.gapped;
+       _st.state = RxState::Streaming;
+     }
++    // fpvDROID: banks the run drops are counted in the status at once, and leave a hole in BankMeta::seq
++    c.on_drop = [&](bool at_start) {
++      std::lock_guard<std::mutex> l(_m);
++      (at_start ? _st.start_late_skips : _st.mid_drops)++;
++    };
++    c.on_unwedge = [&] {
++      std::lock_guard<std::mutex> l(_m);
++      _st.unwedged++;
++    };
++    uint32_t run_next = 0; // the run's own number (BankInfo::seq) of the bank after the last one delivered
+     bool clean_start = false;
+-    const auto on_bank = [&](const uint8_t *bank, const BankInfo &) {
++    const auto on_bank = [&](const uint8_t *bank, const BankInfo &bi) {
+       if (!clean_start) {
+         clean_start = true;
+         consecutive_faults = 0;
++        unwedge_tried = false;
+         std::lock_guard<std::mutex> l(_m);
+         _st.error.clear();
+       }
++      seq += bi.seq - run_next; // fpvDROID: the run's count includes the banks it dropped before this one
++      run_next = bi.seq + 1;
+       meta.seq = seq++;
++      meta.end_us = bi.end_us;
+       {
+         std::lock_guard<std::mutex> l(_m);
+         _st.banks++;
+@@ -319,12 +369,26 @@ void Receiver::worker() {
+     // The count and the reason change together: a status() read between them would show a new
+     // restart with the old (or no) text, and the reason is the only record of why.
+     RxState next = RxState::Starting;
++    RxGaveUp gave_up = RxGaveUp::No;
+     std::string why = "stream fault (restarting): " + ss.error;
+     if (!_s->reg().alive()) {
+       next = RxState::Lost;
+       why = "adapter lost: " + ss.error;
++    } else if (ss.wedged && !unwedge_tried) {
++      // fpvDROID: the run has pulsed the RX DMA on its way out, which frees a wedged C2H engine (stream88xx.cpp,
++      // unwedge): one new start, as after any fault. From now on the onboard program does it (above).
++      unwedge_tried = true;
++      wedge_seen = true;
++      why = "stream wedged, RX DMA pulsed (restarting): " + ss.error;
++    } else if (ss.wedged) {
++      // fpvDROID: wedged again before a bank came: stop now, and say why, so that the owner opens the adapter
++      // again instead of waiting out five more failed starts
++      next = RxState::Error;
++      gave_up = RxGaveUp::Wedged;
++      why = "stream wedged, open the adapter again: " + ss.error;
+     } else if (++consecutive_faults >= 5) {
+       next = RxState::Error;
++      gave_up = RxGaveUp::StreamFailing;
+       why = "stream keeps failing: " + ss.error;
+     }
+     {
+@@ -333,10 +397,17 @@ void Receiver::worker() {
+       _st.state = next;
+       _st.error = why;
+       _st.last_fault = why;
++      _st.gave_up = gave_up;
++      if (ss.wedged && next == RxState::Starting)
++        _st.unwedged++;
+     }
+     if (next != RxState::Starting)
+       break;
+-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    // fpvDROID: was 100 ms. A restart is a hole in the stream (in the picture) as long as this pause, the next
++    // start's drain and the bring-up of the run add up to; 10 ms brings a restart's hole from ~200 ms to ~55 ms
++    // on a host that restarts every few seconds (Pixel 8 Pro, USB 3), with no more failed starts. The
++    // 5-faults-in-a-row rule above still ends a stream that never runs.
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+   }
+ }
+ 
 diff --git a/src/receiver.h b/src/receiver.h
-index 740bd8f..79a8132 100644
+index f107565..43a4d49 100644
 --- a/src/receiver.h
 +++ b/src/receiver.h
-@@ -46,6 +46,9 @@ inline uint16_t model_pid(uint16_t vid, uint16_t pid) {
+@@ -47,6 +47,9 @@ inline uint16_t model_pid(uint16_t vid, uint16_t pid) {
  
  struct RxSettings {
    double freq = 5180e6; // requested centre
@@ -61,19 +302,111 @@ index 740bd8f..79a8132 100644
    int rate_sel = 5;     // fs = 80 MHz >> rate_sel: 5 = 2.5, 4 = 5, 3 = 10, 2 = 20, 1 = 40 MS/s; 0 = 80 MS/s
                          // (8812BU, gapped only: 80 MHz width + vendor BW80 RX DFIR, ~77 MHz at -6 dB)
    bool wide = true;     // at 40 MS/s: 40 MHz channel width (8812BU: + vendor BW40 RX DFIR; 8822C: devourer's
+@@ -73,8 +76,15 @@ struct RxCaps {
+ enum class RxState { Closed, Opening, Starting, Streaming, Lost, Error };
+ const char *rx_state_name(RxState s);
+ 
++// Play League: USB 3 recovery, process-wide, read at each stream start (default on). On: once a host has wedged an
++// adapter's C2H engine, the onboard program frees it in place (StreamCfg::unwedge_us), and banks too late to go
++// out whole are skipped (StreamCfg::skip_late). Off: the stream as before fpvDROID's recovery. Any thread.
++void set_usb3_recovery(bool on);
++bool usb3_recovery();
++
+ struct BankMeta {
+-  uint64_t seq = 0;      // banks delivered since start()
++  uint64_t seq = 0;      // banks since start(). fpvDROID: counting those a run dropped (late or overrun, see
++                         // RxStatus), so a step of more than 1 within one gen means samples are missing there
+   uint32_t gen = 0;      // stream run (changes on every restart: reset DSP state when it does)
+   uint32_t cfg = 0;      // settings generation (changes only when the caller changed settings)
+   double fs = 0;         // sample rate
+@@ -85,10 +95,22 @@ struct BankMeta {
+   bool cu = false;
+   bool gapped = false;   // each bank is a complete capture, but banks are not contiguous (a ~1.5 ms gap
+                          // between them): FFT within a bank only, no continuous recording
++  double end_us = 0;     // fpvDROID (from the Play RX fork): on the adapter's own clock, from the bank's last sample
++                         // to its last packet shipped (BankInfo::end_us); with the time the bank came in, when its
++                         // samples were taken (less the USB transfer)
+ };
+ 
+ using BankSink = std::function<void(const uint8_t *bank, size_t bytes, const BankMeta &)>;
+ 
++// fpvDROID: why the worker ended by itself with state Error, for an owner that acts on it (the text in
++// RxStatus::error is for people, and its wording may change).
++enum class RxGaveUp : uint8_t {
++  No,            // it has not, or it ended another way (the adapter lost, a retune that kept failing)
++  Wedged,        // the 8822B's C2H engine wedged (stream88xx.cpp, c2h_wedged) and the RX DMA pulse that frees it
++                 // did not bring a bank: opening the adapter again recovers it
++  StreamFailing, // the stream failed five starts in a row
++};
++
+ struct RxStatus {
+   RxState state = RxState::Closed;
+   uint64_t banks = 0, restarts = 0;
+@@ -102,6 +124,15 @@ struct RxStatus {
+   bool settling = false; // a settings change is waiting to be applied (the run above is about to end)
+   bool gapped = false;   // the current run is gapped (BankMeta::gapped)
+   unsigned start_retries = 0; // stream starts repeated because the first packet never came (issue #2)
++  // fpvDROID: banks the 8822B stream dropped instead of delivering them, counted as it drops them: late among the
++  // first few of a run / late or overrun mid-run (the run goes on; before, each of these ended it and showed in
++  // restarts). Since open().
++  uint64_t start_late_skips = 0, mid_drops = 0;
++  // fpvDROID: set when the worker ends by itself (see RxGaveUp); it stays until open().
++  RxGaveUp gave_up = RxGaveUp::No;
++  // fpvDROID: wedges freed without that, since open(): by the onboard program inside the bank (nothing lost, or a
++  // bank), and by the pulse and new start after a wedge that got past it (a restart, counted there too).
++  uint64_t unwedged = 0;
+ };
+ 
+ class Receiver {
 diff --git a/src/session.cpp b/src/session.cpp
-index d66ab4e..11c4b0e 100644
+index c876980..2574ec5 100644
 --- a/src/session.cpp
 +++ b/src/session.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,8 @@
  #include "session.h"
  #include "receiver.h" // model_pid
  
++#include <cstdio>
 +#include <cstdlib>
  #include <stdexcept>
  
  #include "UsbOpen.h"
-@@ -94,6 +95,17 @@ void Session::open(const OpenOpts &o) {
+@@ -9,7 +11,24 @@
+ 
+ namespace wsdr {
+ 
+-
++// fpvDROID: whether the link is SuperSpeed. libusb asks the kernel, and for a device opened from an fd (Android) it
++// can only do so with USBDEVFS_GET_SPEED, which older kernels lack (an LG G7 on Android 10, kernel 4.9): the speed
++// comes back unknown. Taken as USB 2, a SuperSpeed link then got 4096-byte EP0 block writes (the USB 2 size in
++// Reg), which the chip stalls: LIBUSB_ERROR_PIPE at the streamer's first block, every start. The descriptors say it
++// then: a bulk endpoint's packets are 1024 bytes only at SuperSpeed (512 at high speed), and a USB 3 device reports
++// bcdUSB 0x0300 or above only while it runs at SuperSpeed (0x0210 at high speed).
++static bool superspeed_link(libusb_device_handle *h) {
++  libusb_device *d = libusb_get_device(h);
++  const int sp = libusb_get_device_speed(d);
++  if (sp != LIBUSB_SPEED_UNKNOWN)
++    return sp >= LIBUSB_SPEED_SUPER;
++  const int mps = libusb_get_max_packet_size(d, 0x84); // the bulk-IN the streams read
++  libusb_device_descriptor dd{};
++  const bool ss = mps > 0 ? mps >= 1024 : libusb_get_device_descriptor(d, &dd) == 0 && dd.bcdUSB >= 0x0300;
++  std::fprintf(stderr, "usb: the kernel does not give the link speed; USB %d from the descriptors (bulk-IN packets %d)\n",
++               ss ? 3 : 2, mps);
++  return ss;
++}
+ 
+ static ChannelWidth_t width_of(int bw) {
+   switch (bw) {
+@@ -85,7 +104,7 @@ void Session::open(const OpenOpts &o) {
+   }
+   _s.adopt_handle(h);
+   _s.adopt_lock(lock);
+-  _ss = libusb_get_device_speed(libusb_get_device(h)) >= LIBUSB_SPEED_SUPER;
++  _ss = superspeed_link(h);
+ 
+   devourer::DeviceConfig cfg;
+   cfg.tuning.thermal_track = o.thermal_track;
+@@ -94,6 +113,17 @@ void Session::open(const OpenOpts &o) {
    // users own bulk-IN and want fixed gain. The switch (tuning.j3_runtime_thread, OpenIPC/devourer#498)
    // is required: the pinned devourer (external/devourer) has it, and a build without it must fail.
    cfg.tuning.j3_runtime_thread = false;
@@ -92,21 +425,158 @@ index d66ab4e..11c4b0e 100644
    auto dev = driver.CreateRadio(h, ctx, lock, cfg);
    if (!dev)
 diff --git a/src/stream88xx.cpp b/src/stream88xx.cpp
-index a663615..df77beb 100644
+index a663615..757810c 100644
 --- a/src/stream88xx.cpp
 +++ b/src/stream88xx.cpp
-@@ -27,6 +27,7 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
+@@ -4,9 +4,12 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <optional>
++#include <string>
+ #include <stdexcept>
++#include <thread>
+ 
+ #include "bulkin88xx.h"
+ #include "c2h88xx.h"
+@@ -27,6 +30,13 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
  constexpr uint8_t kSentinel[8] = {0xE1, 0xF1, 0x47, 0x5E, 0xA5, 0xA5, 0xA5, 0xA5}; // stream8822b.S
  
  constexpr unsigned kStartRetries = 2;
 +constexpr uint32_t kStartGraceBanks = 4; // AnalogRX: late banks tolerated (dropped) at the start of a run
++
++// fpvDROID: the slack in a bank's deadlines (adc_back5 in run()), in fifths of a us. kPartMargin5: for a packet taken
++// unevenly. kBankSend5: how long a whole bank takes to go out at USB 3, part 0's start to the trailer (a Pixel 8 Pro
++// at 40 MS/s: 168..181 us for 90 % of banks, median 173).
++constexpr int32_t kPartMargin5 = 100; // 20 us
++constexpr int32_t kBankSend5 = 825;   // 165 us
  
  size_t chunk_off(int k) { return Stream8822b::kPrefix + static_cast<size_t>(k) * Stream8822b::kChunk; }
  
-@@ -156,11 +157,31 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+@@ -53,21 +63,55 @@ uint8_t fill(int bank, size_t i) { // synthetic pattern
+ }
+ 
+ // Where the CPU program got to, for a missed first packet: its DMEM state block (magic, seq, state,
+-// t_arm), the chip clock, the C2H trigger and the LA engine.
++// t_arm), the chip clock, the C2H trigger and the LA engine. fpvDROID: and the RX DMA registers the C2H wedge
++// is known by (notes/c2h-wedge-handoff.md: r288 BIT7 overflow, r280 / r10c / r284 / r290 as left).
+ std::string chip_state(Reg &r, Cpu8822b &cpu) {
+   try {
+     const uint32_t now = r.r32(0x0568);
+     uint32_t s[5];
+     cpu.dmem_read(kStateOff, s, sizeof s);
+-    char b[160];
+-    std::snprintf(b, sizeof b, "; magic %08x seq %u state %u t_arm %u now %u r294 %08x r7c0 %08x", s[0], s[1],
+-                  s[2], s[4], now, r.r32(0x0294), r.r32(0x07C0));
++    char b[320];
++    std::snprintf(b, sizeof b,
++                  "; magic %08x seq %u state %u t_arm %u now %u r294 %08x r7c0 %08x r288 %08x r284 %08x r280 %08x "
++                  "r10c %08x r290 %08x",
++                  s[0], s[1], s[2], s[4], now, r.r32(0x0294), r.r32(0x07C0), r.r32(0x0288), r.r32(0x0284),
++                  r.r32(0x0280), r.r32(0x010C), r.r32(0x0290));
+     return b;
+   } catch (const std::exception &e) {
+     return std::string("; state unreadable: ") + e.what();
+   }
+ }
+ 
++// fpvDROID: the C2H engine has wedged (FINDINGS §4, notes/c2h-wedge-handoff.md, signature (a)): no packet has come
++// for a whole timeout, yet the request last written to 0x294 is still pending (BIT16). A working engine takes a
++// request in ~40 us; this one never will. It depends on the USB 3 host: never on most, every few seconds on one AMD
++// xHCI controller, every few seconds to minutes on a Pixel 8 Pro. A new start alone does not bring it back; unwedge()
++// below does. Read twice, apart.
++bool c2h_wedged(Reg &r) {
++  try {
++    if (!(r.r32(0x0294) & 0x10000u))
++      return false;
++    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    return (r.r32(0x0294) & 0x10000u) != 0;
++  } catch (...) {
++    return false; // the chip does not answer: not this (an unplug, which the Receiver reports as Lost)
++  }
++}
++
++// fpvDROID: what frees a wedged engine without opening the adapter again: the RX DMA enables in REG_CR
++// (HCI_RXDMA_EN and RXDMA_EN, 0x100 bits 1 and 3) off and on. MEASURED on a Pixel 8 Pro at 20 MS/s, 93 wedges, each
++// given one of nine candidates in turn and then a new start: this one brought the stream back 13 times of 13, and
++// REG_CR = 0 and back 13 of 13; a new start alone, 0x294 = 0, RW_RELEASE_EN, RXPKT_RELEASE_POLL, the RXDMA mode and
++// aggregation off and on, SET_INTERFACE and a USB port reset, 0 of 13 or 14 each. A wedged chip reads RXDMA_REQ
++// (0x284 BIT19) clear where a streaming one has it set; the pulse sets it again. The onboard program gives the same
++// pulse by itself, within the bank (StreamCfg::unwedge_us); this one is for a wedge that got past it.
++void unwedge(Reg &r) {
++  const uint16_t cr = r.r16(0x0100);
++  r.w16(0x0100, static_cast<uint16_t>(cr & ~0x000Au));
++  std::this_thread::sleep_for(std::chrono::milliseconds(2));
++  r.w16(0x0100, cr);
++}
++
+ } // namespace
+ 
+ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const BankInfo &)> &on_bank,
+@@ -84,11 +128,33 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+   InOrderReader rd(_s.handle(), _s.context(), _c.depth);
+   const uint32_t period5 = 512u << _c.la.rate_sel;
+   const int32_t guard5 = _c.guard_us * 5;
++  // fpvDROID: when the ADC is back at byte `at` of a bank, in fifths of a us after the bank is due: it is back at the
++  // bank's first byte (period - guard) after due, and goes through the bank in one period. Each deadline is this
++  // less some slack:
++  //  - data packet k may start until the ADC is back at its descriptor, at chunk_off(k) - 24, less kPartMargin5.
++  //    The chip takes a packet faster than the ADC writes one (16376 bytes in 38..49 us against 51 at 40 MS/s), so
++  //    a part that starts ahead of the ADC stays ahead;
++  //  - the bank may end until the ADC is back at its end, less kPartMargin5: after that the sentinel written behind
++  //    it would land on the next revolution's samples;
++  //  - the onboard program skips a bank that would start too late to go out whole before the ADC is back at its
++  //    first byte: that time less kBankSend5 (skip5).
++  const auto adc_back5 = [&](size_t at) {
++    return static_cast<int32_t>(period5) - guard5 + static_cast<int32_t>(at * period5 / kBankBytes);
++  };
++  // fpvDROID: how late a bank may start before the onboard program skips it: 20 us at 40 MS/s, ~225 us at 20 MS/s
++  // (0: never; so in gapped mode, where every round starts afresh). A bank that starts later has parts going out
++  // after the ADC is back in it, and the chip often sends such a part short; a pause leaves several banks in a row
++  // late, and the short banks end the run on the burst rule. Skipped at once, it costs one bank and the next is on
++  // time. The measurements are in fpvDROID's patches/c2h-wedge.md.
++  const uint32_t skip5 =
++      _c.skip_late && !_c.gapped ? static_cast<uint32_t>(std::max(1, adc_back5(0) - kBankSend5)) : 0;
+ 
+   uint8_t data_desc[24], trl_desc[24];
+   desc(data_desc, kChunk);
+   desc(trl_desc, kTrailerPayload);
+   std::vector<uint8_t> bank(kBankBytes);
++  constexpr int kFull = 16384, kCut = 15360; // fpvDROID: a whole transfer; a packet short of its end (see below)
++  std::vector<uint8_t> mend(2 * kFull);
+   bool seen[2] = {false, false};
+   const auto t0 = clk::now();
+   // The whole start sequence; repeatable (load() halts and platform-resets the CPU first).
+@@ -108,8 +174,11 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     std::memcpy(trl, trl_desc, 24);
+     r.sram_write(kTrailerOcp, trl, sizeof trl);
+ 
+-    uint32_t state[10] = {0, 0, 0, 0, 0, _c.synthetic ? 0u : 1u, period5, static_cast<uint32_t>(guard5), 0,
+-                          _c.gapped ? 1u : 0u};
++    // fpvDROID: five more words: the wait before an RX DMA pulse (StreamCfg::unwedge_us, 0 for none), the
++    // program's own note of when a request was written, its count of pulses, how late a bank may start before the
++    // program skips it (skip5), and its count of banks skipped
++    uint32_t state[15] = {0, 0, 0, 0, 0, _c.synthetic ? 0u : 1u, period5, static_cast<uint32_t>(guard5), 0,
++                          _c.gapped ? 1u : 0u, _c.unwedge_us, 0, 0, skip5, 0};
+     std::memcpy(&state[8], data_desc, 4);
+     cpu.dmem_write(kStateOff, state, sizeof state);
+     uint32_t rec[2][16] = {};
+@@ -124,7 +193,7 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     cpu.dmem_write(kRecOff, rec, sizeof rec);
+ 
+     rd.start();
+-    rd.drain(30);
++    rd.drain(10);  // fpvDROID: was 30 ms; a packet ships in ~40 us (see the Receiver's pause between starts)
+     cpu.start();
+     // Now and then (~1 start in 30, issue #2) the CPU stalls at its first MAC-register access (the LA
+     // arm) until the host itself reads the MAC block; a read of 0x0003 or 0x0080 does not release it.
+@@ -155,12 +224,59 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     la.snapshot(); // before cpu.load(): its SRAM writes move the debug window (0x0106 / 0x0140)
      start();
  
-     const double budget5 = static_cast<double>(period5) - guard5;
+-    const double budget5 = static_cast<double>(period5) - guard5;
 +    // Play League: a bank the host collected too late mid-run (Windows pauses a bulk-IN read for a few hundred
 +    // us now and then: ~1-3 a minute per adapter) used to end the run, and the restart cost far more than the
 +    // bank. The bank is overrun either way - its trailer ends late ("deadline"), or the ADC overwrote a part's
@@ -126,19 +596,85 @@ index a663615..df77beb 100644
 +        std::fprintf(stderr, "stream: bank %u %s, dropped (%u this run)\n", s, why.c_str(), st.mid_drops);
 +      return true;
 +    };
++    unsigned odd_k = 0; // fpvDROID: packets put back together from a cut point other than 8192 (see below)
++    constexpr unsigned kMaxStrays = 256;
++    const auto stray = [&](uint32_t s, int part, const uint8_t *p, int n, unsigned &here) {
++      if (st.strays < 8) {
++        std::fprintf(stderr, "stream: stray bank %u part %d len %d:", s, part, n);
++        for (int i = 0; i < std::min(n, 24); i++)
++          std::fprintf(stderr, " %02x", p[i]);
++        std::fprintf(stderr, "\n");
++      }
++      st.strays++;
++      if (++here > kMaxStrays)
++        throw std::runtime_error("framing: bank " + std::to_string(s) + ": more than " + std::to_string(kMaxStrays) +
++                                 " strays");
++    };
++    // fpvDROID: the bank in hand cannot be completed (a packet of it came short of its end, below): dropped as a late
++    // one is, among the first few of a run or mid-run. False: too many at once, the run ends.
++    const auto drop_cut = [&](uint32_t s, int part, bool dropped_already) {
++      st.cut++;
++      if (dropped_already)
++        return true;
++      if (s < kStartGraceBanks) {
++        if (st.start_late_skips++ < 4)
++          std::fprintf(stderr, "stream: bank %u part %d cut short at the start of the run, dropped\n", s, part);
++        return true;
++      }
++      return mid_drop(s, "part " + std::to_string(part) + " cut short");
++    };
      for (uint32_t seq = 0;; seq++) {
        if (stop && *stop)
          break;
-       const int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
+-      const int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
++      int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
        int part = 0;
 +      bool late_skip = false;
++      unsigned strays_here = 0; // fpvDROID: strays skipped while this bank was read
        BankInfo bi;
        bi.seq = seq;
        bi.bank = b;
-@@ -200,12 +221,30 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+@@ -174,6 +290,13 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+             stopped = true;
+             break;
+           }
++          // fpvDROID: a wedged C2H engine is not worth another start (see c2h_wedged): say so at once, and the
++          // Receiver gives up on the run so that its owner can open the adapter afresh
++          if (c2h_wedged(r)) {
++            st.wedged = true;
++            throw std::runtime_error("C2H wedged (bank " + std::to_string(seq) + " part " + std::to_string(part) +
++                                     ")" + chip_state(r, cpu));
++          }
+           const std::string why = first ? chip_state(r, cpu) : ""; // mid-stream the chip may not answer
+           if (retry) {
+             std::fprintf(stderr, "stream: no first packet in %u ms, starting again%s\n", first_ms, why.c_str());
+@@ -189,43 +312,178 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+         if (d.status != LIBUSB_TRANSFER_COMPLETED)
+           throw std::runtime_error("bulk-IN status " + std::to_string(d.status));
+         const bool c2h = d.len >= 24 && (d.data[11] & 0x10);
+-        if (!c2h) {
+-          if (st.strays < 8) {
+-            std::fprintf(stderr, "stream: stray bank %u part %d len %d:", seq, part, d.len);
+-            for (int i = 0; i < std::min(d.len, 24); i++)
+-              std::fprintf(stderr, " %02x", d.data[i]);
+-            std::fprintf(stderr, "\n");
+-          }
+-          st.strays++;
++        // fpvDROID: nor is a transfer of no length a packet of the stream can have one of its packets, whatever its
++        // byte 11 says: a data packet, a trailer, the full transfer that starts a packet with bytes before it, or a
++        // last data packet cut short with its trailer (both below). MEASURED on a Pixel 8 Pro at 40 MS/s, 11 new
++        // starts in 3 minutes recorded: three were a 134..138-byte packet that is none of the stream's (the same
++        // bytes each time, 0b b4 82 cd ...) and happens to have that bit set, and after a pause of the host come
++        // bare 24-byte descriptors and pieces of packets. Skipped, the bank they were in comes one part short and
++        // is dropped as any such bank; the run goes on. More than kMaxStrays in one bank still ends it.
++        const bool shaped = d.len == static_cast<int>(24 + kChunk) || d.len == static_cast<int>(24 + kTrailerPayload) ||
++                            d.len == kFull || d.len == kCut + static_cast<int>(24 + kTrailerPayload);
++        if (!c2h || !shaped) {
++          stray(seq, part, d.data, d.len, strays_here);
            rd.release();
            continue;
          }
+-        const bool trailer = part == 4;
 +        // AnalogRX: the late start (above) overruns the next bank too; the chip then sends that bank's trailer
 +        // early, one 16 KiB part short. Within the first banks of a run, drop the incomplete bank and go on.
 +        // Play League: mid-run the same overrun is dropped too (see mid_drop), once per bank.
@@ -150,33 +686,142 @@ index a663615..df77beb 100644
 +          rd.release();
 +          break;
 +        }
-         const bool trailer = part == 4;
++        // fpvDROID: a data packet can come with K bytes before it, K a multiple of the 1024-byte USB packet: a full
++        // 16384-byte transfer with the packet's descriptor at K, and one of K - 8 bytes with the rest. Two things do
++        // that (MEASURED on a Pixel 8 Pro at 20 MS/s; 10 of the odd ones recorded, the stream in step after each):
++        //  - the onboard program freed the packet with an RX DMA pulse (SEND in stream8822b.S), and the K bytes are
++        //    what had left the chip by then, the packet's own start: then all of it comes again. K is 8192 for a
++        //    wedged packet (97 % of the wedges are at a bank's first packet, and the bank still ends inside its
++        //    time, ~275 us after due of the 390 allowed), and 6144, 13312 or 14336 were seen where the pulse came on
++        //    a packet that was only slow. The packet at K is whole.
++        //  - the packet before came short of its last 1016 bytes (the chip, no pulse about it), so nothing ended its
++        //    transfer and the next packet ran on in it: K is 15360 and the bytes before K are not the packet's
++        //    start. The bank cannot be completed and is dropped; the packet at K is the next one, whole. Cut so, a
++        //    bank's last data packet has the trailer straight after it instead, in one 15552-byte transfer.
++        // Before, only K = 8192 was put right, and each of the others cost a new start (2 to 10 a minute).
++        bool trailer = part == 4;
++        const uint8_t *pkt = d.data;
++        int len = d.len;
++        if (!trailer && d.len == kFull) {
++          std::memcpy(mend.data(), d.data, kFull);
++          rd.release();
++          const bool got = next(d, _c.pkt_timeout_ms) && d.status == LIBUSB_TRANSFER_COMPLETED;
++          const int k = got ? d.len + 8 : 0;
++          if (k < 1024 || k > kCut || k % 1024 || std::memcmp(mend.data() + k, data_desc, 12) != 0) {
++            // not that: the full transfer was a stray. The one after it (still in hand, or not come yet) is for the
++            // top of the loop to look at afresh.
++            stray(seq, part, mend.data(), kFull, strays_here);
++            continue;
++          }
++          std::memcpy(mend.data() + kFull, d.data, static_cast<size_t>(d.len));
++          // (the second only ever with K = 15360, and not at a bank's last data packet, which the trailer follows)
++          if (k != kCut || part == 3 || std::memcmp(mend.data(), mend.data() + k, static_cast<size_t>(kFull - k)) == 0) {
++            st.mended++; // its own start, then all of it
++            if (k != 8192 && (++odd_k <= 4 || odd_k % 50 == 0))
++              std::fprintf(stderr, "stream: bank %u part %d: the packet came with its first %d bytes twice, put back "
++                                   "together (%u such this run)\n", seq, part, k, odd_k);
++          } else {       // the packet before, cut short, then this one: the next part
++            if (!drop_cut(seq, part, late_skip))
++              throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
++                                       " cut short");
++            late_skip = true;
++            part++;
++          }
++          pkt = mend.data() + k;
++          len = static_cast<int>(24 + kChunk);
++        } else if (part == 3 && d.len == kCut + static_cast<int>(24 + kTrailerPayload) &&
++                   std::memcmp(d.data, data_desc, 12) == 0 && std::memcmp(d.data + kCut, trl_desc, 12) == 0) {
++          if (!drop_cut(seq, part, late_skip))
++            throw std::runtime_error("framing: bank " + std::to_string(seq) + " part 3 cut short");
++          late_skip = true;
++          part = 4;
++          trailer = true;
++          pkt = d.data + kCut;
++          len = static_cast<int>(24 + kTrailerPayload);
++        }
          const uint8_t *want = trailer ? trl_desc : data_desc;
          const size_t want_len = 24 + (trailer ? kTrailerPayload : kChunk);
 -        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0)
 -          throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
 -                                   " len " + std::to_string(d.len) + " desc " + hex12(d.data));
-+        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0) {
++        if (static_cast<size_t>(len) != want_len || std::memcmp(pkt, want, 12) != 0) {
 +          // Play League: a data part of the right length whose descriptor the ADC overwrote (an overrun, see
 +          // mid_drop): keep reading the bank's parts so the stream stays in step, then drop the bank.
-+          const bool overrun = !trailer && static_cast<size_t>(d.len) == want_len && seq >= kStartGraceBanks &&
-+                               (late_skip || mid_drop(seq, "part " + std::to_string(part) + " overwritten (" + hex12(d.data) + ")"));
++          const bool overrun = !trailer && static_cast<size_t>(len) == want_len && seq >= kStartGraceBanks &&
++                               (late_skip || mid_drop(seq, "part " + std::to_string(part) + " overwritten (" + hex12(pkt) + ")"));
 +          if (!overrun)
 +            throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
-+                                     " len " + std::to_string(d.len) + " desc " + hex12(d.data));
++                                     " len " + std::to_string(len) + " desc " + hex12(pkt));
 +          late_skip = true;
 +        }
          if (!trailer) {
-           std::memcpy(bank.data() + chunk_off(part), d.data + 24, kChunk);
+-          std::memcpy(bank.data() + chunk_off(part), d.data + 24, kChunk);
++          std::memcpy(bank.data() + chunk_off(part), pkt + 24, kChunk);
          } else {
-@@ -217,15 +256,33 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
-           bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
-           bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
-           bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
+-          std::memcpy(bank.data(), d.data + 24, kPrefix);
+-          uint32_t stamp[4];
+-          std::memcpy(stamp, d.data + 24 + kPrefix, sizeof stamp);
+-          if (stamp[0] != seq)
+-            throw std::runtime_error("trailer seq " + std::to_string(stamp[0]) + " != " + std::to_string(seq));
+-          bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
+-          bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
+-          bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
 -          if (!_c.gapped && bi.end_us * 5 > budget5) // gapped: the LA is stopped while a bank ships
 -            throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
 -                                     std::to_string(bi.end_us) + " us after due");
-+          if (!_c.gapped && bi.end_us * 5 > budget5) { // gapped: the LA is stopped while a bank ships
++          std::memcpy(bank.data(), pkt + 24, kPrefix);
++          TrailerStamps ts;
++          std::memcpy(&ts, pkt + 24 + kPrefix, sizeof ts);
++          if (ts.seq != seq) {
++            // fpvDROID: the onboard program skipped banks it was too late for, and counts them in the trailer: this is
++            // the bank after them. Dropped banks to the caller, but not a burst: the stream is in step and on time
++            // again, so the burst count starts afresh too (the pause that made the chip late has usually cost a
++            // few short banks already, and the next marginal one would end the run).
++            const uint32_t jump = ts.seq - seq;
++            if (ts.skipped - st.skipped != jump || jump > 100000)
++              throw std::runtime_error("trailer seq " + std::to_string(ts.seq) + " != " + std::to_string(seq));
++            drop_burst = 0;
++            for (uint32_t i = 0; i < jump; i++) {
++              st.mid_drops++;
++              if (_c.on_drop)
++                _c.on_drop(seq + i < kStartGraceBanks);
++            }
++            st.skipped += jump;
++            if (st.skipped <= 8 || st.skipped % 500 < jump)
++              std::fprintf(stderr, "stream: bank %u: the chip skipped %u bank(s) it was too late for (%u this run)\n",
++                           ts.seq, jump, st.skipped);
++            seq = ts.seq;
++            bi.seq = seq;
++            b = _c.gapped ? 0 : static_cast<int>(seq & 1);
++            bi.bank = b;
++          }
++          if (ts.pulses != st.rx_pulses) { // fpvDROID: the onboard program freed a stuck request (see SEND)
++            if (ts.pulses <= 3 || ts.pulses % 200 == 0)
++              std::fprintf(stderr, "stream: bank %u: the chip pulsed its RX DMA to free a stuck packet (%u this run, "
++                                   "%u packets put back together), the bank ended %.0f us after due\n",
++                           seq, ts.pulses, st.mended, static_cast<int32_t>(ts.end5 - ts.target5) / 5.0);
++            if (_c.on_unwedge)
++              for (uint32_t i = st.rx_pulses; i != ts.pulses; i++)
++                _c.on_unwedge();
++            st.rx_pulses = ts.pulses;
++          }
++          const int32_t end5 = static_cast<int32_t>(ts.end5 - ts.target5);
++          bi.late_us = static_cast<int32_t>(ts.start5 - ts.target5) / 5.0;
++          bi.ship_us = static_cast<int32_t>(ts.end5 - ts.start5) / 5.0;
++          bi.end_us = end5 / 5.0;
++          // fpvDROID: late is a part that started after the ADC came back to it, or a bank that ended after the ADC
++          // came back to its end (adc_back5). Before, late was a bank that ended after the ADC came back to its
++          // first byte: that dropped every bank of a host whose banks take a little longer to go out (an LG G7+ at
++          // 40 MS/s), though each of their parts was read out ahead of the ADC.
++          std::string late_why;
++          for (int k = 0; k < 4 && late_why.empty(); k++) {
++            const int32_t at5 = static_cast<int32_t>((k == 0 ? ts.start5 : ts.taken5[k - 1]) - ts.target5);
++            if (at5 > adc_back5(chunk_off(k) - 24) - kPartMargin5)
++              late_why = "part " + std::to_string(k) + " started " + std::to_string(at5 / 5) + " us after due";
++          }
++          if (late_why.empty() && end5 > adc_back5(kBankBytes) - kPartMargin5)
++            late_why = "ended " + std::to_string(static_cast<int>(bi.end_us)) + " us after due";
++          if (!_c.gapped && !late_why.empty()) { // gapped: the LA is stopped while a bank ships
 +            // AnalogRX: behind a USB hub the first bank of a run ships ~190 us late every time (the hub's
 +            // downstream link waking up), and the run used to fail on it, restart, and fail again for ever.
 +            // A late bank among the first few is dropped (its samples are partly overwritten); later ones
@@ -184,13 +829,11 @@ index a663615..df77beb 100644
 +            if (seq < kStartGraceBanks) {
 +              late_skip = true;
 +              if (st.start_late_skips++ < 4)
-+                std::fprintf(stderr, "stream: bank %u ended %.1f us after due at the start of the run, dropped\n",
-+                             seq, bi.end_us);
-+            } else if (late_skip || mid_drop(seq, "ended " + std::to_string(static_cast<int>(bi.end_us)) + " us after due")) {
++                std::fprintf(stderr, "stream: bank %u %s at the start of the run, dropped\n", seq, late_why.c_str());
++            } else if (late_skip || mid_drop(seq, late_why)) {
 +              late_skip = true;  // Play League: dropped mid-run instead of ending it (see mid_drop)
 +            } else {
-+              throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
-+                                       std::to_string(bi.end_us) + " us after due");
++              throw std::runtime_error("deadline: bank " + std::to_string(seq) + " " + late_why);
 +            }
 +          }
          }
@@ -201,16 +844,57 @@ index a663615..df77beb 100644
          break;
 +      if (late_skip) {  // AnalogRX: a late bank at the start of the run is not handed on (see above)
 +        seen[b] = true;
++        if (_c.on_drop)  // fpvDROID: nor is one dropped mid-run; either way the caller hears of it now
++          _c.on_drop(seq < kStartGraceBanks);
 +        continue;
 +      }
        // CPU-written windows: descriptors ([104,128) and the 24 bytes before chunks 1..3) and the
        // sentinel in the last sample. In live data the ADC must have overwritten all of them.
        uint8_t *tail = bank.data() + kBankBytes - 8;
+@@ -260,6 +518,12 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+   } catch (...) {
+   }
+   rd.stop();
++  if (st.wedged) { // fpvDROID: free the engine for the next start; the Receiver allows that start one try
++    try {
++      unwedge(r);
++    } catch (...) {
++    }
++  }
+   la.restore();
+   if (rx)
+     rx->restore();
 diff --git a/src/stream88xx.h b/src/stream88xx.h
-index 69c6cb3..0b04054 100644
+index 69c6cb3..ad60cef 100644
 --- a/src/stream88xx.h
 +++ b/src/stream88xx.h
-@@ -51,6 +51,8 @@ struct StreamStats {
+@@ -33,6 +33,20 @@ struct StreamCfg {
+   int guard_us = 20;       // ship a bank this long after the ADC is due to finish it (< 0: test only)
+   bool gapped = false;     // capture one bank, stop, ship, re-arm (banks not contiguous)
+   unsigned pkt_timeout_ms = 200;
++  // fpvDROID: the onboard program switches the RX DMA enables off and on when the C2H engine has not taken a
++  // request after this many us, which frees a wedged one (SEND in stream8822b.S; unwedge() in stream88xx.cpp). The
++  // engine takes a 16 KiB packet in 38..49 us on USB 3 and in ~350 us on USB 2, where it never wedges: for USB 3
++  // only. 0: the program waits for ever, as upstream. on_unwedge: called on the stream thread for each such pulse.
++  unsigned unwedge_us = 0;
++  std::function<void()> on_unwedge;
++  // fpvDROID: the onboard program does not ship a bank it would start too late to go out whole before the ADC comes
++  // back to it, and the next one goes on time (counted in StreamStats::skipped and as dropped banks, not as a burst,
++  // and the burst count starts afresh after it).
++  bool skip_late = true;
++  // fpvDROID: called on the stream thread each time run() drops a bank instead of handing it to on_bank (late or
++  // overrun), as it happens: StreamStats only comes back when the run ends, and a run that keeps dropping an
++  // occasional bank never does. at_start: one of the first banks of the run (start_late_skips), else mid_drops.
++  std::function<void(bool at_start)> on_drop;
+ };
+ 
+ struct BankInfo {
+@@ -47,22 +61,45 @@ struct BankInfo {
+ 
+ struct StreamStats {
+   uint64_t banks = 0;
+-  unsigned strays = 0;     // non-C2H packets skipped (MAC RX frames)
++  unsigned strays = 0;     // non-C2H packets skipped (MAC RX frames); fpvDROID: and what has no length of the stream's
    unsigned stale = 0;
    unsigned pattern_bad = 0;
    unsigned start_retries = 0; // starts repeated because the first packet never came (issue #2)
@@ -219,6 +903,40 @@ index 69c6cb3..0b04054 100644
    double late_max_us = 0, ship_max_us = 0, end_max_us = 0;
    double wall_s = 0;
    std::string error;       // empty unless the stream stopped on a fault
++  bool wedged = false;     // fpvDROID: the fault was the C2H wedge; run() has pulsed the RX DMA, so one new start
++                           // may bring the stream back, and if not, opening the adapter again does
++  unsigned rx_pulses = 0;  // fpvDROID: RX DMA pulses the onboard program gave to free a stuck request (unwedge_us)
++  unsigned mended = 0;     // fpvDROID: packets that came with their start twice after such a pulse, put right
++  unsigned cut = 0;        // fpvDROID: packets that came short of their end (their bank is dropped, the run goes on)
++  unsigned skipped = 0;    // fpvDROID: banks the onboard program did not ship, being too late for them (skip_late)
+ };
+ 
++// fpvDROID: what the onboard program writes behind the trailer's prefix (stream8822b.S, "Trailer payload"). Times
++// are 5 x REG 0x568, fifths of a us; counts are since the run started.
++struct TrailerStamps {
++  uint32_t seq;       // the bank's number in the run
++  uint32_t target5;   // when the bank was due
++  uint32_t start5;    // when its first data packet started
++  uint32_t end5;      // when its last one had gone
++  uint32_t pulses;    // RX DMA pulses given (StreamCfg::unwedge_us)
++  uint32_t taken5[4]; // when each data packet had been taken: taken5[k] is when packet k + 1 starts (the last
++                      // one is not read by the stream)
++  uint32_t skipped;   // banks skipped (StreamCfg::skip_late)
++};
++static_assert(sizeof(TrailerStamps) == 40, "the onboard program writes ten words");
++
+ class Stream8822b {
+ public:
+   static constexpr size_t kBankBytes = 0x10000;
+   static constexpr size_t kBankSamples = kBankBytes / 8;
+   static constexpr size_t kPrefix = 128;
+   static constexpr size_t kChunk = 16352;
+-  static constexpr size_t kTrailerPayload = kPrefix + 16;
++  // fpvDROID: + the pulse count, when each data packet was taken and the banks skipped (was kPrefix + 16)
++  static constexpr size_t kTrailerPayload = kPrefix + sizeof(TrailerStamps);
+ 
+   Stream8822b(Session &s, const StreamCfg &c) : _s(s), _c(c) {}
+   double fs() const { return 80e6 / (1u << _c.la.rate_sel); }
 diff --git a/src/usbmode.cpp b/src/usbmode.cpp
 index 4c09dbb..6994181 100644
 --- a/src/usbmode.cpp

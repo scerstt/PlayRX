@@ -1,0 +1,463 @@
+diff --git a/native/dsp/video.cpp b/native/dsp/video.cpp
+index e1abe8a..7f47dd2 100644
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -125,6 +125,8 @@ public:
+ 
+   DecoderStats stats() const {
+     DecoderStats s;
++    s.dn_noise = dn_noise;
++    s.dn_still = dn_still;
+     s.acquiring = acquiring;
+     s.sign = sign;
+     s.tip = tip;
+@@ -275,6 +277,16 @@ private:
+   float vdiff = 0, cfade = 0, csrc = 0;
+   bool comb_mode = true, comb_on = false;
+   double cdel_comb = 0;
++  std::atomic<bool> dn_on{false}, ec_on{false};  // AnalogRX HD picture (FrontEnd::set_picture)
++  // AnalogRX denoise: the row as it was last field, |difference| histogram for the noise estimate
++  std::vector<uint32_t> dn_prev;
++  std::vector<float> ec_y;  // AnalogRX edge colour: the row's brightness (0 black .. 1 white)
++  std::vector<float> ec_up;  // ... and the row above it in this field
++  int64_t ec_up_k = -2;
++  uint64_t ec_up_f = ~0ull;
++  uint32_t dn_hist[256] = {}, dn_chist[256] = {};
++  uint64_t dn_px = 0, dn_blend = 0;
++  float dn_noise = 3.f, dn_cnoise = 8.f, dn_still = 0;
+   bool low = false, longrun = false;
+   uint64_t low_start = 0;
+   double T = 0, line_start = -1;
+@@ -297,7 +309,12 @@ private:
+   std::thread fw;
+   std::mutex fm;
+   std::condition_variable fcv;
+-  std::vector<uint8_t> fp_a, fp_b;
++  std::vector<uint8_t> fp_a, fp_b, fp_mf, fp_mg;
++  bool fp_weave = false;
++  // AnalogRX still weave (PictureOpts::still_weave): each field's brightness a frame ago and its motion since
++  std::atomic<bool> sw_on{false};
++  std::vector<uint8_t> sw_prevA, sw_prevB, sw_motA, sw_motB, sw_y;
++  uint64_t sw_seen[2] = {~0ull, ~0ull};  // fields_seen when each field (A, B) last ended: weave only with the field just before
+   int fp_kind = 0, fp_w = 0, fp_h = 0;
+   bool fp_upper = false, fp_have = false, f_quit = false;
+   const VideoStd *fp_std = nullptr;
+@@ -584,6 +601,10 @@ private:
+     const cf rot = std::polar(1.f, static_cast<float>(-c_phase));
+     const double cdel = comb_on ? cdel_comb : 0.21e-6 * fs;  // chroma filter delay minus luma filter delay
+     const bool pal = std_ == &kPal;
++    const bool dn = dn_on.load(std::memory_order_relaxed);
++    if (dn) dn_prev.assign(row, row + o.width);  // this row as it was shown last field
++    const bool ec = col && ec_on.load(std::memory_order_relaxed);
++    if (ec) ec_y.assign(o.width, 0.f);
+     for (int x = 0; x < o.width; x++) {
+       const double p = ls + a0 + aw * x / o.width;
+       const int64_t i0 = static_cast<int64_t>(p);
+@@ -594,6 +615,7 @@ private:
+       const float f = static_cast<float>(p - i0);
+       const float v0 = luma_ring[i0 & ring_mask], v1 = luma_ring[(i0 + 1) & ring_mask];
+       const float y = sign * (v0 + (v1 - v0) * f - sign * blank) * yscale;
++      if (ec) ec_y[x] = y;
+       float r = y, g = y, bl = y;
+       if (col) {
+         const double pc = p + cdel;
+@@ -617,10 +639,95 @@ private:
+       const auto q = [](float z) { return static_cast<uint32_t>(std::clamp(z * 255.f, 0.f, 255.f)); };
+       row[x] = 0xff000000u | q(bl) << 16 | q(g) << 8 | q(r);  // bytes R, G, B, X
+     }
++    if (ec) {
++      edge_colour_row(row, ec_up_k == k - 1 && ec_up_f == fields_seen);
++      ec_up.swap(ec_y);
++      ec_up_k = k;
++      ec_up_f = fields_seen;
++    }
++    if (dn) denoise_row(row);
+     if (rep) mend_rows(k, hit);
+     if (o.lines) o.lines(Line{reinterpret_cast<const uint8_t *>(row), o.width, static_cast<int>(k), cur_field, std_->active, std_});
+   }
+ 
++  // AnalogRX clean colour at sharp edges (PictureOpts::edge_colour): where the brightness within +-4 pixels (and just above)
++  // spans more than
++  // half of black-to-white, the colour fades out (fully past 0.8): those fringes are brightness mistaken for colour.
++  void edge_colour_row(uint32_t *row, bool up) {
++    constexpr int R = 4;
++    const int W = o.width;
++    for (int x = 0; x < W; x++) {
++      float lo = 1e9f, hi = -1e9f;
++      for (int j = std::max(0, x - R); j <= std::min(W - 1, x + R); j++) lo = std::min(lo, ec_y[j]), hi = std::max(hi, ec_y[j]);
++      if (up)  // and the row above (this field): the steps at the tops and bottoms of letters
++        for (int j = std::max(0, x - 1); j <= std::min(W - 1, x + 1); j++) lo = std::min(lo, ec_up[j]), hi = std::max(hi, ec_up[j]);
++      const float fade = std::clamp((hi - lo - 0.5f) / 0.3f, 0.f, 1.f);
++      if (fade <= 0) continue;
++      const uint32_t c = row[x];
++      const float y = std::clamp(ec_y[x], 0.f, 1.f) * 255.f, keep = 1.f - fade;
++      const auto m = [&](uint32_t ch) { return static_cast<uint32_t>(std::clamp(y + (static_cast<float>(ch) - y) * keep + 0.5f, 0.f, 255.f)); };
++      row[x] = 0xff000000u | m((c >> 16) & 0xff) << 16 | m((c >> 8) & 0xff) << 8 | m(c & 0xff);
++    }
++  }
++
++  // AnalogRX denoise: blend the freshly drawn row with the same row last field (dn_prev, what was shown) where the
++  // two barely differ, brightness and colour each on its own (colour is far noisier on a weak signal, and the eye
++  // forgives it lagging a little). sigma = that part's noise, from the last field's differences: under 1.5 sigma
++  // the new value counts 1/4 (noise averages over ~7 pictures), past 3.5 sigma it is shown as drawn (motion: no
++  // trails). Where the brightness moved, the colour follows it at once.
++  void denoise_row(uint32_t *row) {
++    const float ty1 = 1.5f * dn_noise, ty2 = 3.5f * dn_noise, iy = 1.f / (ty2 - ty1);
++    const float tc1 = 1.5f * dn_cnoise, tc2 = 3.5f * dn_cnoise, ic = 1.f / (tc2 - tc1);
++    constexpr float kMin = 0.25f;
++    uint64_t blended = 0;
++    for (int x = 0; x < o.width; x++) {
++      const uint32_t c = row[x], p = dn_prev[x];
++      const float cr = static_cast<float>(c & 0xff), cg = static_cast<float>((c >> 8) & 0xff), cb = static_cast<float>((c >> 16) & 0xff);
++      const float pr = static_cast<float>(p & 0xff), pg = static_cast<float>((p >> 8) & 0xff), pb = static_cast<float>((p >> 16) & 0xff);
++      const float cy = 0.299f * cr + 0.587f * cg + 0.114f * cb, py = 0.299f * pr + 0.587f * pg + 0.114f * pb;
++      const float cu = cb - cy, cv = cr - cy, pu = pb - py, pv = pr - py;
++      const float dy = std::fabs(cy - py), dc = std::max(std::fabs(cu - pu), std::fabs(cv - pv));
++      dn_hist[std::min(255, static_cast<int>(dy * 4.f))]++;
++      dn_chist[std::min(255, static_cast<int>(dc * 2.f))]++;
++      const float ay = dy <= ty1 ? kMin : dy >= ty2 ? 1.f : kMin + (1.f - kMin) * (dy - ty1) * iy;
++      float ac = dc <= tc1 ? kMin : dc >= tc2 ? 1.f : kMin + (1.f - kMin) * (dc - tc1) * ic;
++      ac = std::max(ac, ay);
++      if (ay >= 1.f && ac >= 1.f) continue;
++      const float y = py + ay * (cy - py), u = pu + ac * (cu - pu), v = pv + ac * (cv - pv);
++      const float r = y + v, b = y + u, g = (y - 0.299f * r - 0.114f * b) * (1.f / 0.587f);
++      const auto q = [](float z) { return static_cast<uint32_t>(std::clamp(z + 0.5f, 0.f, 255.f)); };
++      row[x] = 0xff000000u | q(b) << 16 | q(g) << 8 | q(r);
++      blended++;
++    }
++    dn_px += o.width;
++    dn_blend += blended;
++  }
++
++  // AnalogRX denoise: at each field's end, the noise from the differences seen. A still part of the picture
++  // differs by |noise|, whose 25th percentile is ~0.34 sigma; motion only pushes the percentile up, so this
++  // errs high in a busy picture (capped: a little less denoise there, never long trails).
++  static float hist_sigma(const uint32_t *h, float per_bin, float lo, float hi) {
++    uint64_t tot = 0;
++    for (int i = 0; i < 256; i++) tot += h[i];
++    if (tot < 10000) return -1;
++    uint64_t c = 0;
++    int p = 0;
++    for (; p < 255; p++) {
++      c += h[p];
++      if (c * 4 >= tot) break;
++    }
++    return std::clamp((p + 0.5f) * per_bin / 0.34f, lo, hi);
++  }
++  void denoise_field_end() {
++    const float sy = hist_sigma(dn_hist, 0.25f, 1.f, 8.f), sc = hist_sigma(dn_chist, 0.5f, 2.f, 64.f);
++    if (sy > 0) dn_noise += 0.25f * (sy - dn_noise);
++    if (sc > 0) dn_cnoise += 0.25f * (sc - dn_cnoise);
++    if (sy > 0) dn_still = dn_px ? static_cast<float>(dn_blend) / dn_px : 0.f;
++    std::memset(dn_hist, 0, sizeof dn_hist);
++    std::memset(dn_chist, 0, sizeof dn_chist);
++    dn_px = dn_blend = 0;
++  }
++
+   // AnalogRX sparkle repair: up to 3 badly hit rows in a row are redrawn from the good rows above and below
+   // them in the same field (blended by distance), once the row below has come in. Nothing older is used, so
+   // there is no tearing in motion; a longer run is left as it is.
+@@ -709,8 +816,14 @@ private:
+   }
+   // AnalogRX smooth lines: field f (the upper field when upper) into the frame at its own lines, the lines
+   // between from the field lines above (p) and below (q), averaged along whichever of 5 directions matches best
+-  // (so a diagonal edge stays a clean diagonal instead of a staircase)
+-  static void build_field(uint8_t *out, const uint8_t *f, bool upper, int W, int A) {
++  // (so a diagonal edge stays a clean diagonal instead of a staircase).
++  // AnalogRX still weave (g, mf, mg given): where nothing has moved, the line between is the other field's real line
++  // (g, the field before this one: already shown) instead of the interpolation: full vertical detail on OSD text and
++  // anything else holding still. mf / mg: this field's and the other field's motion (|brightness change| against
++  // the same field a frame earlier); past kStill the interpolation takes over, fully by kMoving (no combing).
++  static constexpr int kStill = 10, kMoving = 26;
++  static void build_field(uint8_t *out, const uint8_t *f, bool upper, int W, int A, const uint8_t *g = nullptr,
++                          const uint8_t *mf = nullptr, const uint8_t *mg = nullptr) {
+     const size_t rowb = static_cast<size_t>(W) * 4;
+     for (int r = 0; r < A; r++) std::memcpy(out + (2 * r + (upper ? 0 : 1)) * rowb, f + r * rowb, rowb);
+     auto lum = [](const uint8_t *px) { return px[0] + 2 * px[1] + px[2]; };
+@@ -719,6 +832,10 @@ private:
+       const int rp = upper ? r : std::max(r - 1, 0), rq = upper ? std::min(r + 1, A - 1) : r;
+       const uint8_t *p = f + rp * rowb, *q = f + rq * rowb;
+       uint8_t *dst = out + line * rowb;
++      // the other field's line here is its row r (lower field A: frame line 2r + 1; upper B: 2r)
++      const uint8_t *gr = g ? g + r * rowb : nullptr;
++      const uint8_t *m1 = mf ? mf + static_cast<size_t>(rp) * W : nullptr, *m2 = mf ? mf + static_cast<size_t>(rq) * W : nullptr;
++      const uint8_t *m3 = mg ? mg + static_cast<size_t>(r) * W : nullptr;
+       for (int x = 0; x < W; x++) {
+         int best = 0, bc = 1 << 30;
+         for (int d = -2; d <= 2; d++) {
+@@ -728,11 +845,47 @@ private:
+           if (c < bc) bc = c, best = d;
+         }
+         const uint8_t *a = p + (x + best) * 4, *b = q + (x - best) * 4;
+-        for (int k = 0; k < 4; k++) dst[x * 4 + k] = static_cast<uint8_t>((a[k] + b[k] + 1) >> 1);
++        if (!gr) {
++          for (int k = 0; k < 4; k++) dst[x * 4 + k] = static_cast<uint8_t>((a[k] + b[k] + 1) >> 1);
++          continue;
++        }
++        int m = 0;
++        for (int j = std::max(0, x - 1); j <= std::min(W - 1, x + 1); j++) m = std::max({m, int(m1[j]), int(m2[j]), int(m3[j])});
++        const int t = std::clamp((m - kStill) * 256 / (kMoving - kStill), 0, 256);  // 0 = still: weave, 256 = moving
++        for (int k = 0; k < 4; k++) {
++          const int e = (a[k] + b[k] + 1) >> 1, w = gr[x * 4 + k];
++          dst[x * 4 + k] = static_cast<uint8_t>(w + (((e - w) * t) >> 8));
++        }
+       }
+     }
+   }
+ 
++  // AnalogRX still weave: at a field's end, its motion against the same field a frame earlier, then this field
++  // becomes the "frame earlier" for next time. Motion = how far the brightness is outside the range of the earlier
++  // picture's pixel and its two neighbours: the line timing wobbles by a fraction of a pixel from frame to frame,
++  // and a still sharp edge (OSD text) must not count as moving because of that.
++  void field_motion(int which) {
++    const std::vector<uint8_t> &f = which == 0 ? fieldA : fieldB;
++    std::vector<uint8_t> &prev = which == 0 ? sw_prevA : sw_prevB, &mot = which == 0 ? sw_motA : sw_motB;
++    const size_t n = f.size() / 4, W = static_cast<size_t>(o.width);
++    if (prev.size() != n) prev.assign(n, 0), mot.assign(n, 255);
++    sw_y.resize(n);
++    for (size_t i = 0; i < n; i++) {
++      const uint8_t *px = &f[i * 4];
++      sw_y[i] = static_cast<uint8_t>((px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8);
++    }
++    for (size_t i = 0; i < n; i++) {
++      const size_t x = i % W;
++      int lo = prev[i], hi = prev[i];
++      if (x > 0) lo = std::min(lo, int(prev[i - 1])), hi = std::max(hi, int(prev[i - 1]));
++      if (x + 1 < W) lo = std::min(lo, int(prev[i + 1])), hi = std::max(hi, int(prev[i + 1]));
++      const int y = sw_y[i];
++      mot[i] = static_cast<uint8_t>(std::min(255, std::max({0, y - hi, lo - y})));
++    }
++    prev.swap(sw_y);
++    sw_seen[which] = fields_seen;
++  }
++
+   static void build_pair(uint8_t *out, const uint8_t *a, const uint8_t *b, int W, int A) {
+     const size_t rowb = static_cast<size_t>(W) * 4;
+     for (int r = 0; r < A; r++) {
+@@ -744,13 +897,19 @@ private:
+   // A finished picture to the sink: built here (the usual way), or (AnalogRX async frames, set_async_frames) the
+   // field(s) copied and handed to the frame thread, which builds the picture and calls the sink there, so this
+   // thread goes straight on drawing the next lines. kind: 0 = smooth field, 1 = field doubled, 2 = two fields woven.
++  // kind 0 with still weave on: b is the other field, and the motion maps go along (see build_field)
+   void deliver(int kind, const std::vector<uint8_t> &a, const std::vector<uint8_t> &b, bool upper) {
+     frames_out++;
+     if (!sink) return;
+     const int W = o.width, A = std_->active;
++    const std::vector<uint8_t> &mf = upper ? sw_motB : sw_motA, &mg = upper ? sw_motA : sw_motB;
++    const size_t px = static_cast<size_t>(W) * A;
++    const bool weave = kind == 0 && sw_on.load(std::memory_order_relaxed) && &a != &b && b.size() == px * 4 &&
++                       mf.size() == px && mg.size() == px &&
++                       sw_seen[upper ? 0 : 1] + 1 == sw_seen[upper ? 1 : 0];
+     if (!async_frames) {
+-      if (kind == 0) build_field(frame.data(), a.data(), upper, W, A);
+-      else build_pair(frame.data(), a.data(), b.data(), W, A);
++      if (kind == 0) build_field(frame.data(), a.data(), upper, W, A, weave ? b.data() : nullptr, weave ? mf.data() : nullptr, weave ? mg.data() : nullptr);
++      else build_pair(frame.data(), a.data(), kind == 2 ? b.data() : a.data(), W, A);
+       sink(Frame{frame.data(), W, 2 * A, std_});
+       return;
+     }
+@@ -758,7 +917,9 @@ private:
+     {
+       std::lock_guard<std::mutex> l(fm);
+       fp_a.assign(a.begin(), a.end());  // a busy frame thread: the newer picture replaces the waiting one
+-      if (kind == 2) fp_b.assign(b.begin(), b.end());
++      if (kind == 2 || weave) fp_b.assign(b.begin(), b.end());
++      if (weave) fp_mf.assign(mf.begin(), mf.end()), fp_mg.assign(mg.begin(), mg.end());
++      fp_weave = weave;
+       fp_kind = kind;
+       fp_upper = upper;
+       fp_w = W;
+@@ -770,10 +931,10 @@ private:
+   }
+ 
+   void frame_thread() {
+-    std::vector<uint8_t> a, b, out;
++    std::vector<uint8_t> a, b, out, mf, mg;
+     for (;;) {
+       int kind, W, A;
+-      bool upper;
++      bool upper, weave;
+       const VideoStd *st;
+       {
+         std::unique_lock<std::mutex> l(fm);
+@@ -782,10 +943,13 @@ private:
+         fp_have = false;
+         a.swap(fp_a);
+         b.swap(fp_b);
++        mf.swap(fp_mf);
++        mg.swap(fp_mg);
++        weave = fp_weave;
+         kind = fp_kind, upper = fp_upper, W = fp_w, A = fp_h, st = fp_std;
+       }
+       out.resize(static_cast<size_t>(W) * 2 * A * 4);
+-      if (kind == 0) build_field(out.data(), a.data(), upper, W, A);
++      if (kind == 0) build_field(out.data(), a.data(), upper, W, A, weave ? b.data() : nullptr, weave ? mf.data() : nullptr, weave ? mg.data() : nullptr);
+       else build_pair(out.data(), a.data(), kind == 2 ? b.data() : a.data(), W, A);
+       sink(Frame{out.data(), W, 2 * A, st});
+     }
+@@ -809,16 +973,19 @@ private:
+       double ph = (static_cast<double>(line_longrun_start) - line_start) / T;
+       ph -= std::floor(ph + 0.25);  // -> [-0.25, 0.75)
+       const bool odd = std::fabs(ph) < 0.25;
++      if (cur_field >= 0) denoise_field_end();  // AnalogRX denoise
+       if (cur_field == 0) {
+         haveA = true;
+-        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldA, fieldA, false);  // A is the lower field (measured)
++        if (sw_on.load(std::memory_order_relaxed)) field_motion(0);  // AnalogRX still weave
++        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldA, fieldB, false);  // A is the lower field (measured)
+       }
+       if (cur_field == 1) {
+         haveB = true;
+-        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldB, fieldB, true);
++        if (sw_on.load(std::memory_order_relaxed)) field_motion(1);
++        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldB, fieldA, true);
+       }
+       if (!o.fields && haveA && haveB) {
+-        deliver(2, fieldA, fieldB, false);
++        deliver(2, fieldB, fieldA, false);  // AnalogRX: B is the upper field (measured): it goes on the even lines
+         haveA = haveB = false;
+       }
+       cur_field = odd ? 0 : 1;
+@@ -879,6 +1046,20 @@ FrontEnd::FrontEnd(double fs_in, double shift_hz, FrameSink sink, const DecoderO
+   }
+   _wr.assign(kHb - 1 + kTab, 0.f);
+   _wi.assign(kHb - 1 + kTab, 0.f);
++  {  // AnalogRX channel filter: windowed sinc (Hamming), -6 dB at 7.2 MHz, flat to ~6 MHz, stop past ~8.5 MHz
++    const double fc = std::min(7.2e6, 0.45 * _fs_out) / _fs_out;
++    double sum = 0;
++    for (int i = 0; i < kCh; i++) {
++      const int k = i - kCh / 2;
++      const double w = 0.54 - 0.46 * std::cos(2 * M_PI * i / (kCh - 1));
++      const double h = k == 0 ? 2 * fc : std::sin(2 * M_PI * fc * k) / (M_PI * k);
++      _ch[i] = static_cast<float>(h * w);
++      sum += h * w;
++    }
++    for (float &h : _ch) h = static_cast<float>(h / sum);
++    _cr.assign(kCh - 1, 0.f);
++    _ci.assign(kCh - 1, 0.f);
++  }
+   _dec = new Decoder(_fs_out, std::move(sink), o);
+   set_shift(shift_hz);
+ }
+@@ -890,6 +1071,22 @@ FrontEnd::~FrontEnd() {
+ 
+ void FrontEnd::set_async_frames(bool on) { _dec->async_frames = on; }
+ 
++void FrontEnd::set_picture(const PictureOpts &p) {
++  _dec->dn_on = p.denoise;
++  _dec->ec_on = p.edge_colour;
++  _dec->sw_on = p.still_weave;
++  _chfilt = p.channel_filter;
++}
++
++PictureOpts FrontEnd::picture() const {
++  PictureOpts p;
++  p.denoise = _dec->dn_on;
++  p.edge_colour = _dec->ec_on;
++  p.still_weave = _dec->sw_on;
++  p.channel_filter = _chfilt;
++  return p;
++}
++
+ void FrontEnd::set_shift(double s) {
+   _shift = s;
+   _tr.resize(kTab);
+@@ -977,6 +1174,29 @@ void FrontEnd::demod(const cf *xs, size_t n, std::vector<float> &out, std::vecto
+       _yi.assign(wi, wi + m);
+     }
+     const int ny = static_cast<int>(_yr.size());
++    {  // AnalogRX channel filter: history always kept, so switching it on mid-stream is clean
++      constexpr int C = kCh - 1;
++      _cr.resize(C + ny);
++      _ci.resize(C + ny);
++      std::memcpy(_cr.data() + C, _yr.data(), ny * sizeof(float));
++      std::memcpy(_ci.data() + C, _yi.data(), ny * sizeof(float));
++      if (_chfilt.load(std::memory_order_relaxed)) {
++        const float *r = _cr.data(), *q = _ci.data();
++        for (int j = 0; j < ny; j++) {  // symmetric taps: half the multiplies
++          float a = _ch[kCh / 2] * r[j + kCh / 2], b = _ch[kCh / 2] * q[j + kCh / 2];
++          for (int t = 0; t < kCh / 2; t++) {
++            a += _ch[t] * (r[j + t] + r[j + kCh - 1 - t]);
++            b += _ch[t] * (q[j + t] + q[j + kCh - 1 - t]);
++          }
++          _yr[j] = a;
++          _yi[j] = b;
++        }
++      }
++      if (ny > 0) {
++        std::memmove(_cr.data(), _cr.data() + ny, C * sizeof(float));
++        std::memmove(_ci.data(), _ci.data() + ny, C * sizeof(float));
++      }
++    }
+     out.resize(o0 + ny);
+     float *d = out.data() + o0;
+     float lr = _prev.real(), li = _prev.imag();
+diff --git a/native/dsp/video.h b/native/dsp/video.h
+index 3e6aa0d..6c38c6a 100644
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -6,6 +6,7 @@
+ //
+ // Single-threaded: feed() and every callback run on the caller's thread.
+ #pragma once
++#include <atomic>
+ #include <complex>
+ #include <cstdint>
+ #include <functional>
+@@ -58,6 +59,8 @@ struct DecoderStats {
+   float lock_recent = 0;                  // locked fraction over the last ~2 fields
+   bool colour = false;                    // colour is being decoded (burst present and steady)
+   float burst_err = 0;                    // mean burst phase error (rad)
++  float dn_noise = 0;                     // AnalogRX denoise: the picture's estimated noise (0..255 steps)
++  float dn_still = 0;                     // ... and the fraction of the last field it blended (0..1)
+   const char *std_name = "?";
+ };
+ 
+@@ -99,6 +102,25 @@ bool adaptive_comb_on();
+ void set_smooth_lines(bool on);
+ bool smooth_lines_on();
+ 
++// AnalogRX HD picture: three features switched per front end (one feed), any time, from any thread.
++//  denoise         steady picture. Each pixel is compared with the same pixel of the previous field of the same
++//                  kind (already shown); where it barely changed (OSD text, sky, a parked quad) the two are blended,
++//                  so the noise averages out over several pictures; where it changed (motion) the new pixel is shown
++//                  as it is. The threshold follows the picture's own noise. Only pictures already shown: no delay.
++//  edge_colour     clean colour at sharp edges. Colour travels in a narrow band (about 1.2 MHz), so real colour can't
++//                  change within a few pixels; the fringes either side of a sharp, strong brightness step (OSD text:
++//                  white letters, black outline) are brightness detail mistaken for colour. Where the brightness
++//                  spans most of black-to-white within +-4 pixels (or just above), the colour fades out. No delay.
++//  channel_filter  before the FM discriminator, the signal is cut to about +-7 MHz around the carrier (an analog
++//                  VTX's occupied width) instead of the whole captured band: less noise reaches the discriminator
++//                  (fewer sparkles near the edge of range). ~0.75 us of filter delay.
++//  still_weave     (smooth lines on) where nothing has moved, the line between a field's lines is the other
++//                  field's real line (the field before: already shown) instead of an interpolation: full vertical
++//                  detail on OSD text and anything else holding still. Moving parts are interpolated as before.
++struct PictureOpts {
++  bool denoise = false, edge_colour = false, channel_filter = false, still_weave = false;
++};
++
+ // IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
+ class FrontEnd {
+ public:
+@@ -117,6 +139,9 @@ public:
+   // AnalogRX async frames: true = whole pictures are built and handed to the FrameSink on a thread of their own,
+   // so the decoding thread goes straight on with the next lines (low latency). Call on the decoding thread.
+   void set_async_frames(bool on);
++  // AnalogRX HD picture (PictureOpts): takes effect from the next line / chunk
++  void set_picture(const PictureOpts &p);
++  PictureOpts picture() const;
+ 
+ private:
+   double _fs_in, _fs_out, _shift = 0;
+@@ -133,6 +158,11 @@ private:
+   Decoder *_dec;
+   std::vector<float> _env;  // sparkle repair: each output sample's envelope (power)
+   float _pref = 0;          // ... and its recent level
++  // AnalogRX channel filter (PictureOpts::channel_filter): switch, taps and history at fs_demod
++  std::atomic<bool> _chfilt{false};
++  static constexpr int kCh = 31;
++  float _ch[kCh];
++  std::vector<float> _cr, _ci;  // kCh-1 of history, then this chunk
+ };
+ 
+ }  // namespace kp

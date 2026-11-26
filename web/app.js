@@ -175,6 +175,7 @@ views.live = (el, arg) => {
     <div class="view-head"><h1>Live</h1><span class="sub" id="live-sub"></span><div class="spacer"></div>
       <span class="faint">Click a feed to show it alone · F11 full screen</span>
       <button class="btn hidden" id="live-ll" title="Low latency: the feed you clicked (or the first) in its own window, each line drawn the moment it arrives instead of a whole picture at a time. F11 or double-click in that window for full screen: the lowest latency."><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg><span>Low latency</span></button>
+      <button class="btn" id="live-hd" title="HD picture on every feed: a steady picture (still parts like OSD text and sky settle down) and less noise near the edge of range. Adds no delay. Highlighted when on. Costs about a fifth of a CPU core per feed. (Sharp OSD is in Settings → Picture.)">HD</button>
       <span class="faint hidden" id="live-llstat" title="In the app: from a line arriving over USB to the moment it is handed to the display (average · worst in the last second). Add the display's own scan-out: about half a refresh (8 ms at 60 Hz, 2 ms at 240 Hz)."></span>
       <label class="row tight hidden" id="live-llsolo" title="While low latency is on, the other feeds stop decoding (their timing and pictures too), so the low latency feed has the PC to itself. They come back when low latency ends."><input type="checkbox" class="switch"><span class="faint">Pause other feeds</span></label>
       <select class="select" id="live-add" title="Watch a channel: adds a feed on it, no setup needed"></select></div>
@@ -193,6 +194,16 @@ views.live = (el, arg) => {
       await pollState();
     } catch { toast('Could not change low latency'); }
   };
+  // HD: on or off for every feed (settings hd); the button is highlighted while it is on
+  const hdBtn = $('#live-hd', el);
+  hdBtn.onclick = async () => {
+    try {
+      S.settings = await post('/api/settings', {hd: !S.settings.hd});
+      toast(S.settings.hd ? 'HD on' : 'HD off');
+      hdUpdate();
+    } catch { toast('Could not change HD'); }
+  };
+  function hdUpdate() { hdBtn.classList.toggle('btn-primary', !!S.settings.hd); }
   function llUpdate() {
     const ll = S.state?.lowlat || {}, on = ll.slot || 0;
     llBtn.classList.toggle('hidden', !ll.supported);
@@ -275,6 +286,7 @@ views.live = (el, arg) => {
     const slots = usedSlots();
     fillAdd();
     llUpdate();
+    hdUpdate();
     $('#live-sub', el).textContent = slots.length ? `${slots.length} ${isRx() ? 'feed' : 'pilot'}${slots.length > 1 ? 's' : ''}` : '';
     const want = new Set(slots.map(s => s.slot));
     for (const [n, t] of tiles) if (!want.has(n)) { t.remove(); tiles.delete(n); }
@@ -670,8 +682,28 @@ views.settings = (el, arg) => {
         stripes at the left edge and faint ghost outlines. On (recommended) keeps the picture clear of it. Retunes every
         receiver straight away.</div></div>
         <input type="checkbox" class="switch" data-s="offset_tune"></div>
+      <div class="setting"><div><div class="setting-t">USB 3 recovery <span class="pill pill-warn">New</span></div>
+        <div class="setting-d">On some USB 3 ports, mostly on older laptops, an adapter's USB link locks up now and then and the
+        picture drops out for a few seconds. On (recommended): after the first lockup on this PC, the adapter frees itself in
+        place, usually without losing a picture, and a bank that would arrive too late is skipped instead of restarting the
+        stream. Turn it off if an adapter seems worse with it. Takes effect at each adapter's next stream start.</div></div>
+        <input type="checkbox" class="switch" data-s="usb3_recovery"></div>
+      <div class="setting" id="usbcheck-row"><div style="flex:1"><div class="setting-t">USB check</div>
+        <div class="setting-d">Watches every open adapter for 20 s and reports how much of its stream arrives, the USB controller
+        it is plugged into, and whether the PC is on battery. Nothing is interrupted: it measures the adapters
+        as they run, so give each one a channel first. Copy the report to send it in if an adapter keeps dropping out.
+        For the best results: laptop on its charger, Windows power mode on Best performance.</div>
+        <div id="usbcheck-out" class="stack" style="margin-top:8px"></div></div>
+        <div class="row" style="gap:6px"><button class="btn btn-sm" id="usbcheck-go">Run check</button>
+        <button class="btn btn-sm" id="usbcheck-copy" hidden>Copy report</button></div></div>
     </div></div>
     <div class="card" data-sec="picture"><div class="card-h"><h3>Picture</h3><div class="spacer"></div><span class="faint">every receiver, straight away; none adds delay</span></div><div class="card-b" style="padding-top:0;padding-bottom:0">
+      <div class="setting"><div><div class="setting-t">Sharp OSD</div>
+        <div class="setting-d">Crisper OSD text. Where the picture is holding still (the OSD, mostly), the lines between each half-picture's
+        lines are the real lines from the other half instead of being filled in, so letters and numbers keep their full height detail;
+        anything moving is filled in as before. Coloured fringes around the letters are taken out too. Uses only pictures
+        already shown: no delay. Applies straight away.</div></div>
+        <input type="checkbox" class="switch" data-s="sharp_osd"></div>
       <div class="setting"><div><div class="setting-t">Smooth lines</div>
         <div class="setting-d">Analog video sends every other line of the picture at a time. Off: each of those lines is shown
         twice (stair-stepped edges, and a slight up-and-down shimmer). On: each line goes in its own place and the ones
@@ -821,6 +853,7 @@ views.settings = (el, arg) => {
   const offCam = onState(camShow);
   camShow();
   $('[data-s=diversity]', el).addEventListener('change', e => toast(e.target.checked ? 'Diversity on: both antennas on every adapter' : 'Diversity off: antenna A only'));
+  usbCheck(el);
   let alive = true;
   const show = () => {
     $('#addr', el).textContent = `http://${S.settings.lan_active ? '<this PC>' : 'localhost'}:${S.settings.port}/`;
@@ -959,3 +992,46 @@ views.log = el => {
     if (!soon) soon = setTimeout(() => { soon = 0; pollState().catch(() => {}); }, 30);
   });
 })();
+
+// Settings -> Receivers -> USB check: start a 20 s watch of every open adapter's stream, show it filling in, then a
+// report line to copy (GET/POST /api/usb_check).
+function usbCheck(el) {
+  const out = $('#usbcheck-out', el), go = $('#usbcheck-go', el), cp = $('#usbcheck-copy', el);
+  if (!out || !go) return;
+  let report = '', stop = null;
+  const show = r => {
+    report = r.report || '';
+    cp.hidden = !report || r.running;
+    go.disabled = !!r.running;
+    go.textContent = r.running ? `Checking… ${Math.ceil(r.left)} s` : r.ran ? 'Run again' : 'Run check';
+    if (!r.ran) { out.innerHTML = ''; return; }
+    const pc = [r.cpu, r.power && (r.power === 'battery' ? '<b class="warn-t">on battery</b>' : 'on mains'),
+      r.plan && `plan ${esc(r.plan)}`, r.mode && (r.mode === 'best power efficiency' ? `<b class="warn-t">mode ${esc(r.mode)}</b>` : `mode ${esc(r.mode)}`)]
+      .filter(Boolean).map(s => s === r.cpu ? esc(s) : s).join(' · ');
+    const rows = (r.adapters || []).map(a => {
+      const who = esc(a.label || a.name || 'Adapter') + ` <span class="faint">${esc(a.id)} · ${isRx() ? "feed" : "pilot"} ${a.slot} · USB ${a.usb3 ? 3 : 2}</span>`;
+      let res;
+      if (a.gone) res = '<span class="faint">released during the check</span>';
+      else if (a.pct < 0) res = `<span class="faint">${a.gapped ? 'timing only (gapped): no sample count' : 'not streaming'}</span>`;
+      else {
+        const good = a.pct >= 99.5 && a.restarts === 0;
+        res = `<b class="${good ? 'ok-t' : 'warn-t'}">${a.pct.toFixed(1)}%</b> of samples · ${a.restarts} restarts · ${a.drops} banks dropped · ${a.unwedged} lockups freed`;
+      }
+      const ctl = a.controller ? `<div class="faint">${esc(a.controller)}</div>` : '';
+      const warn = !a.usb3 ? '<div class="warn-t">USB 2 link: too slow for video. Use a blue USB 3 port, a USB 3 cable or a powered USB 3 hub.</div>' : '';
+      return `<div>${who}<div>${res}</div>${ctl}${warn}</div>`;
+    }).join('') || '<div class="faint">No adapter was open when the check started. Give each adapter a channel first, then run it again.</div>';
+    out.innerHTML = (pc ? `<div class="faint">${pc}</div>` : '') + rows;
+  };
+  const poll = () => get('/api/usb_check').then(r => {
+    show(r);
+    if (!r.running && stop) { stop(); stop = null; }
+    return r;
+  });
+  const watch = () => { if (!stop) stop = every(1000, poll, () => el.isConnected); };
+  go.onclick = () => post('/api/usb_check', {seconds: 20}).then(r => { show(r); watch(); });
+  cp.onclick = async () => {
+    try { await navigator.clipboard.writeText(report); toast('USB check report copied'); } catch { prompt('Copy this:', report); }
+  };
+  poll().then(r => { if (r.running) watch(); }).catch(() => {});
+}

@@ -349,7 +349,8 @@ void FeedServer::serve(uintptr_t sock) {
     std::string lower = req.substr(0, hdr_end);
     for (char &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     const size_t cl = lower.find("\r\ncontent-length:");
-    const size_t want = cl == std::string::npos ? 0 : std::min<size_t>(65536, std::strtoul(lower.c_str() + cl + 17, nullptr, 10));
+    const size_t cap = 65536;
+    const size_t want = cl == std::string::npos ? 0 : std::min<size_t>(cap, std::strtoul(lower.c_str() + cl + 17, nullptr, 10));
     body = req.substr(hdr_end + 4);
     while (body.size() < want) {
       const int k = ::recv(s, buf, sizeof buf, 0);
